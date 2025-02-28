@@ -4,6 +4,7 @@ import logging
 import typing as t
 from functools import partial
 from sqlglot import exp
+from sqlglot.helper import ensure_list
 
 from sqlmesh.core.engine_adapter.base_postgres import BasePostgresEngineAdapter
 from sqlmesh.core.engine_adapter.mixins import (
@@ -18,6 +19,7 @@ from sqlmesh.core.schema_diff import SchemaDiffer
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import TableName
     from sqlmesh.core.engine_adapter._typing import DF, QueryOrDF
+    from sqlmesh.core.node import IntervalUnit
 
 logger = logging.getLogger(__name__)
 
@@ -123,3 +125,38 @@ class PostgresEngineAdapter(
             when_matched=when_matched,
             merge_filter=merge_filter,
         )
+
+    def _build_table_properties_exp(
+        self,
+        catalog_name: t.Optional[str] = None,
+        table_format: t.Optional[str] = None,
+        storage_format: t.Optional[str] = None,
+        partitioned_by: t.Optional[t.List[exp.Expression]] = None,
+        partition_interval_unit: t.Optional[IntervalUnit] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
+        table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        table_kind: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> t.Optional[exp.Properties]:
+        """Creates a SQLGlot table properties expression for ddl."""
+        properties: t.List[exp.Expression] = []
+
+        if table_format:
+            properties.append(exp.FileFormatProperty(this=exp.Var(this=table_format)))
+
+        if table_description:
+            properties.append(
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
+            )
+
+        if table_properties:
+            table_type = self._pop_creatable_type_from_properties(table_properties)
+            properties.extend(ensure_list(table_type))
+
+        if properties:
+            return exp.Properties(expressions=properties)
+        return None

@@ -92,6 +92,19 @@ def test_create_table_like(make_mocked_engine_adapter: t.Callable):
     )
 
 
+def test_create_table_access_method(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(PostgresEngineAdapter)
+    adapter.create_table(
+        "foo",
+        {"a": exp.DataType.build("Int8", dialect=adapter.dialect)},
+        table_format="columnar",
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE TABLE IF NOT EXISTS "foo" ("a" BIGINT) USING columnar',
+    ]
+
+
 def test_merge_version_gte_15(make_mocked_engine_adapter: t.Callable):
     adapter = make_mocked_engine_adapter(PostgresEngineAdapter)
     adapter._connection_pool.get().server_version = 150000
