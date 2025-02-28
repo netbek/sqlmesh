@@ -47,7 +47,7 @@ setup(
         "rich[jupyter]",
         "ruamel.yaml",
         "setuptools; python_version>='3.12'",
-        "sqlglot[rs]~=26.6.0",
+        "sqlglot @ https://raw.githubusercontent.com/netbek/sqlglot/postgres-table-access-method-dist/dist/sqlglot-0.1.dev5234-py3-none-any.whl",
         "tenacity",
         "time-machine",
     ],
