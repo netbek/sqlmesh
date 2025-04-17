@@ -762,12 +762,6 @@ model_defaults:
 
     ctx = Context(paths=tmp_path, config=config)
 
-    mocker.patch.object(
-        Context,
-        "_snapshot_gateways",
-        new_callable=mocker.PropertyMock(return_value={"snapshot": "athena"}),
-    )
-
     assert isinstance(ctx._connection_config, RedshiftConnectionConfig)
     assert len(ctx.engine_adapters) == 2
     assert isinstance(ctx.engine_adapters["athena"], AthenaEngineAdapter)
@@ -963,3 +957,11 @@ def test_environment_statements_config(tmp_path):
         "@grant_schema_privileges()",
         "GRANT REFERENCES ON FUTURE VIEWS IN DATABASE db TO ROLE admin_role;",
     ]
+
+
+# https://github.com/TobikoData/sqlmesh/pull/4049
+def test_pydantic_import_error() -> None:
+    class TestConfig(DuckDBConnectionConfig):
+        pass
+
+    TestConfig()

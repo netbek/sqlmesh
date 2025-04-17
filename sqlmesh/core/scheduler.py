@@ -1,5 +1,4 @@
 from __future__ import annotations
-from enum import Enum
 import logging
 import typing as t
 from sqlglot import exp
@@ -7,6 +6,7 @@ from sqlmesh.core import constants as c
 from sqlmesh.core.console import Console, get_console
 from sqlmesh.core.environment import EnvironmentNamingInfo, execute_environment_statements
 from sqlmesh.core.macros import RuntimeStage
+from sqlmesh.core.model.definition import AuditResult
 from sqlmesh.core.node import IntervalUnit
 from sqlmesh.core.notification_target import (
     NotificationEvent,
@@ -21,6 +21,7 @@ from sqlmesh.core.snapshot import (
     earliest_start_date,
     missing_intervals,
     merge_intervals,
+    snapshots_to_dag,
     Intervals,
 )
 from sqlmesh.core.snapshot.definition import (
@@ -29,6 +30,7 @@ from sqlmesh.core.snapshot.definition import (
     parent_snapshots_by_name,
 )
 from sqlmesh.core.state_sync import StateSync
+from sqlmesh.utils import CompletionStatus
 from sqlmesh.utils.concurrency import concurrent_apply_to_dag, NodeExecutionFailedError
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.date import (
@@ -44,24 +46,6 @@ SnapshotToIntervals = t.Dict[Snapshot, Intervals]
 # we store snapshot name instead of snapshots/snapshotids because pydantic
 # is extremely slow to hash. snapshot names should be unique within a dag run
 SchedulingUnit = t.Tuple[str, t.Tuple[Interval, int]]
-
-
-class CompletionStatus(Enum):
-    SUCCESS = "success"
-    FAILURE = "failure"
-    NOTHING_TO_DO = "nothing_to_do"
-
-    @property
-    def is_success(self) -> bool:
-        return self == CompletionStatus.SUCCESS
-
-    @property
-    def is_failure(self) -> bool:
-        return self == CompletionStatus.FAILURE
-
-    @property
-    def is_nothing_to_do(self) -> bool:
-        return self == CompletionStatus.NOTHING_TO_DO
 
 
 class Scheduler:
@@ -93,6 +77,7 @@ class Scheduler:
     ):
         self.state_sync = state_sync
         self.snapshots = {s.snapshot_id: s for s in snapshots}
+        self.snapshots_by_name = {snapshot.name: snapshot for snapshot in self.snapshots.values()}
         self.snapshot_per_version = _resolve_one_snapshot_per_version(self.snapshots.values())
         self.default_catalog = default_catalog
         self.snapshot_evaluator = snapshot_evaluator
@@ -165,7 +150,7 @@ class Scheduler:
         deployability_index: DeployabilityIndex,
         batch_index: int,
         **kwargs: t.Any,
-    ) -> None:
+    ) -> t.Tuple[t.List[AuditResult], t.List[AuditError]]:
         """Evaluate a snapshot and add the processed interval to the state sync.
 
         Args:
@@ -177,6 +162,9 @@ class Scheduler:
             batch_index: If the snapshot is part of a batch of related snapshots; which index in the batch is it
             auto_restatement_enabled: Whether to enable auto restatements.
             kwargs: Additional kwargs to pass to the renderer.
+
+        Returns:
+            Tuple of list of all audit results from the evaluation and list of non-blocking audit errors to warn.
         """
         validate_date_range(start, end)
 
@@ -206,6 +194,7 @@ class Scheduler:
         )
 
         audit_errors_to_raise: t.List[AuditError] = []
+        audit_errors_to_warn: t.List[AuditError] = []
         for audit_result in (result for result in audit_results if result.count):
             error = AuditError(
                 audit_name=audit_result.audit.name,
@@ -223,15 +212,13 @@ class Scheduler:
             if audit_result.blocking:
                 audit_errors_to_raise.append(error)
             else:
-                get_console().log_warning(
-                    f"\n{error}.",
-                    long_message=f"{error}. Audit query:\n{error.query.sql(error.adapter_dialect)}",
-                )
+                audit_errors_to_warn.append(error)
 
         if audit_errors_to_raise:
             raise NodeAuditsErrors(audit_errors_to_raise)
 
         self.state_sync.add_interval(snapshot, start, end, is_dev=not is_deployable)
+        return audit_results, audit_errors_to_warn
 
     def run(
         self,
@@ -347,34 +334,42 @@ class Scheduler:
     def batch_intervals(
         self,
         merged_intervals: SnapshotToIntervals,
-        start: t.Optional[TimeLike] = None,
-        end: t.Optional[TimeLike] = None,
-        execution_time: t.Optional[TimeLike] = None,
+        deployability_index: t.Optional[DeployabilityIndex],
     ) -> t.Dict[Snapshot, Intervals]:
-        def expand_range_as_interval(
-            start_ts: int, end_ts: int, interval_unit: IntervalUnit
-        ) -> t.List[Interval]:
-            values = expand_range(start_ts, end_ts, interval_unit)
-            return [(values[i], values[i + 1]) for i in range(len(values) - 1)]
+        dag = snapshots_to_dag(merged_intervals)
 
-        dag = DAG[str]()
-
-        for snapshot in merged_intervals:
-            dag.add(snapshot.name, [p.name for p in snapshot.parents])
-
-        snapshot_intervals = {
-            snapshot: [
-                i
-                for interval in intervals
-                for i in expand_range_as_interval(*interval, snapshot.node.interval_unit)
-            ]
+        snapshot_intervals: t.Dict[SnapshotId, t.Tuple[Snapshot, t.List[Interval]]] = {
+            snapshot.snapshot_id: (
+                snapshot,
+                [
+                    i
+                    for interval in intervals
+                    for i in _expand_range_as_interval(*interval, snapshot.node.interval_unit)
+                ],
+            )
             for snapshot, intervals in merged_intervals.items()
         }
         snapshot_batches = {}
         all_unready_intervals: t.Dict[str, set[Interval]] = {}
-        for snapshot, intervals in snapshot_intervals.items():
+        for snapshot_id in dag:
+            if snapshot_id not in snapshot_intervals:
+                continue
+            snapshot, intervals = snapshot_intervals[snapshot_id]
             unready = set(intervals)
-            intervals = snapshot.check_ready_intervals(intervals)
+
+            from sqlmesh.core.context import ExecutionContext
+
+            adapter = self.snapshot_evaluator.get_adapter(snapshot.model_gateway)
+
+            context = ExecutionContext(
+                adapter,
+                self.snapshots_by_name,
+                deployability_index,
+                default_dialect=adapter.dialect,
+                default_catalog=self.default_catalog,
+            )
+
+            intervals = snapshot.check_ready_intervals(intervals, context)
             unready -= set(intervals)
 
             for parent in snapshot.parents:
@@ -429,17 +424,15 @@ class Scheduler:
         """
         execution_time = execution_time or now_timestamp()
 
-        batched_intervals = self.batch_intervals(merged_intervals, start, end, execution_time)
+        batched_intervals = self.batch_intervals(merged_intervals, deployability_index)
 
         self.console.start_evaluation_progress(
-            {snapshot: len(intervals) for snapshot, intervals in batched_intervals.items()},
+            batched_intervals,
             environment_naming_info,
             self.default_catalog,
         )
 
         dag = self._dag(batched_intervals)
-
-        snapshots_by_name = {snapshot.name: snapshot for snapshot in self.snapshots.values()}
 
         if run_environment_statements:
             environment_statements = self.state_sync.get_environment_statements(
@@ -451,7 +444,7 @@ class Scheduler:
                 runtime_stage=RuntimeStage.BEFORE_ALL,
                 environment_naming_info=environment_naming_info,
                 default_catalog=self.default_catalog,
-                snapshots=snapshots_by_name,
+                snapshots=self.snapshots_by_name,
                 start=start,
                 end=end,
                 execution_time=execution_time,
@@ -464,17 +457,19 @@ class Scheduler:
             snapshot_name, ((start, end), batch_idx) = node
             if batch_idx == -1:
                 return
-            snapshot = snapshots_by_name[snapshot_name]
+            snapshot = self.snapshots_by_name[snapshot_name]
 
             self.console.start_snapshot_evaluation_progress(snapshot)
 
             execution_start_ts = now_timestamp()
             evaluation_duration_ms: t.Optional[int] = None
 
+            audit_results: t.List[AuditResult] = []
+            audit_errors_to_warn: t.List[AuditError] = []
             try:
                 assert execution_time  # mypy
                 assert deployability_index  # mypy
-                self.evaluate(
+                audit_results, audit_errors_to_warn = self.evaluate(
                     snapshot=snapshot,
                     start=start,
                     end=end,
@@ -482,10 +477,29 @@ class Scheduler:
                     deployability_index=deployability_index,
                     batch_index=batch_idx,
                 )
+
+                for audit_error in audit_errors_to_warn:
+                    display_name = snapshot.display_name(
+                        environment_naming_info,
+                        self.default_catalog,
+                        self.snapshot_evaluator.adapter.dialect,
+                    )
+                    self.console.log_warning(
+                        f"\n{display_name}: {audit_error}.",
+                        f"{audit_error}. Audit query:\n{audit_error.query.sql(audit_error.adapter_dialect)}",
+                    )
+
                 evaluation_duration_ms = now_timestamp() - execution_start_ts
             finally:
+                num_audits = len(audit_results)
+                num_audits_failed = sum(1 for result in audit_results if result.count)
                 self.console.update_snapshot_evaluation_progress(
-                    snapshot, batch_idx, evaluation_duration_ms
+                    snapshot,
+                    batched_intervals[snapshot][batch_idx],
+                    batch_idx,
+                    evaluation_duration_ms,
+                    num_audits - num_audits_failed,
+                    num_audits_failed,
                 )
 
         try:
@@ -504,7 +518,7 @@ class Scheduler:
                     runtime_stage=RuntimeStage.AFTER_ALL,
                     environment_naming_info=environment_naming_info,
                     default_catalog=self.default_catalog,
-                    snapshots=snapshots_by_name,
+                    snapshots=self.snapshots_by_name,
                     start=start,
                     end=end,
                     execution_time=execution_time,
@@ -686,3 +700,10 @@ def _resolve_one_snapshot_per_version(
                 snapshot_per_version[key] = snapshot
 
     return snapshot_per_version
+
+
+def _expand_range_as_interval(
+    start_ts: int, end_ts: int, interval_unit: IntervalUnit
+) -> t.List[Interval]:
+    values = expand_range(start_ts, end_ts, interval_unit)
+    return [(values[i], values[i + 1]) for i in range(len(values) - 1)]

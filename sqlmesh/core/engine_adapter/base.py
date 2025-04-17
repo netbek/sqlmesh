@@ -119,6 +119,7 @@ class EngineAdapter:
         register_comments: bool = True,
         pre_ping: bool = False,
         pretty_sql: bool = False,
+        shared_connection: bool = False,
         **kwargs: t.Any,
     ):
         self.dialect = dialect.lower() or self.DIALECT
@@ -126,7 +127,10 @@ class EngineAdapter:
             connection_factory_or_pool
             if isinstance(connection_factory_or_pool, ConnectionPool)
             else create_connection_pool(
-                connection_factory_or_pool, multithreaded, cursor_init=cursor_init
+                connection_factory_or_pool,
+                multithreaded,
+                shared_connection=shared_connection,
+                cursor_init=cursor_init,
             )
         )
         self._sql_gen_kwargs = sql_gen_kwargs or {}
@@ -371,33 +375,32 @@ class EngineAdapter:
                 column_descriptions=column_descriptions,
                 **kwargs,
             )
-        else:
-            if self_referencing:
-                with self.temp_table(
-                    self._select_columns(columns_to_types).from_(target_table),
-                    name=target_table,
-                    columns_to_types=columns_to_types,
-                    **kwargs,
-                ) as temp_table:
-                    for source_query in source_queries:
-                        source_query.add_transform(
-                            lambda node: (  # type: ignore
-                                temp_table  # type: ignore
-                                if isinstance(node, exp.Table)
-                                and quote_identifiers(node) == quote_identifiers(target_table)
-                                else node
-                            )
+        if self_referencing:
+            with self.temp_table(
+                self._select_columns(columns_to_types).from_(target_table),
+                name=target_table,
+                columns_to_types=columns_to_types,
+                **kwargs,
+            ) as temp_table:
+                for source_query in source_queries:
+                    source_query.add_transform(
+                        lambda node: (  # type: ignore
+                            temp_table  # type: ignore
+                            if isinstance(node, exp.Table)
+                            and quote_identifiers(node) == quote_identifiers(target_table)
+                            else node
                         )
-                    return self._insert_overwrite_by_condition(
-                        target_table,
-                        source_queries,
-                        columns_to_types,
                     )
-            return self._insert_overwrite_by_condition(
-                target_table,
-                source_queries,
-                columns_to_types,
-            )
+                return self._insert_overwrite_by_condition(
+                    target_table,
+                    source_queries,
+                    columns_to_types,
+                )
+        return self._insert_overwrite_by_condition(
+            target_table,
+            source_queries,
+            columns_to_types,
+        )
 
     def create_index(
         self,
@@ -887,6 +890,8 @@ class EngineAdapter:
         """
         if not self.SUPPORTS_CLONING:
             raise NotImplementedError(f"Engine does not support cloning: {type(self)}")
+
+        kwargs.pop("rendered_physical_properties", None)
         self.execute(
             exp.Create(
                 this=exp.to_table(target_table_name),
@@ -1042,17 +1047,25 @@ class EngineAdapter:
         if materialized_properties:
             partitioned_by = materialized_properties.pop("partitioned_by", None)
             clustered_by = materialized_properties.pop("clustered_by", None)
-            if partitioned_by and (
-                partitioned_by_prop := self._build_partitioned_by_exp(
-                    partitioned_by, **materialized_properties
+            if (
+                partitioned_by
+                and (
+                    partitioned_by_prop := self._build_partitioned_by_exp(
+                        partitioned_by, **materialized_properties
+                    )
                 )
+                is not None
             ):
                 materialized_properties["catalog_name"] = exp.to_table(view_name).catalog
                 properties.append("expressions", partitioned_by_prop)
-            if clustered_by and (
-                clustered_by_prop := self._build_clustered_by_exp(
-                    clustered_by, **materialized_properties
+            if (
+                clustered_by
+                and (
+                    clustered_by_prop := self._build_clustered_by_exp(
+                        clustered_by, **materialized_properties
+                    )
                 )
+                is not None
             ):
                 properties.append("expressions", clustered_by_prop)
 

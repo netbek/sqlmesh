@@ -131,14 +131,14 @@ class ModelKindMixin:
     @property
     def full_history_restatement_only(self) -> bool:
         """Whether or not this model only supports restatement of full history."""
-        return self.model_kind_name in (
-            ModelKindName.INCREMENTAL_UNMANAGED,
-            ModelKindName.INCREMENTAL_BY_UNIQUE_KEY,
-            ModelKindName.INCREMENTAL_BY_PARTITION,
-            ModelKindName.SCD_TYPE_2,
-            ModelKindName.MANAGED,
-            ModelKindName.FULL,
-            ModelKindName.VIEW,
+        return (
+            self.is_incremental_unmanaged
+            or self.is_incremental_by_unique_key
+            or self.is_incremental_by_partition
+            or self.is_scd_type_2
+            or self.is_managed
+            or self.is_full
+            or self.is_view
         )
 
     @property
@@ -405,6 +405,7 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
     )
     time_column: TimeColumn
     auto_restatement_intervals: t.Optional[SQLGlotPositiveInt] = None
+    partition_by_time_column: SQLGlotBool = True
 
     _time_column_validator = TimeColumn.validator()
 
@@ -415,6 +416,11 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
             expressions=[
                 *(expressions or []),
                 self.time_column.to_property(kwargs.get("dialect") or ""),
+                *_properties(
+                    {
+                        "partition_by_time_column": self.partition_by_time_column,
+                    }
+                ),
                 *(
                     [_property("auto_restatement_intervals", self.auto_restatement_intervals)]
                     if self.auto_restatement_intervals is not None
@@ -431,6 +437,7 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
     def metadata_hash_values(self) -> t.List[t.Optional[str]]:
         return [
             *super().metadata_hash_values,
+            str(self.partition_by_time_column),
             str(self.auto_restatement_intervals)
             if self.auto_restatement_intervals is not None
             else None,
@@ -989,9 +996,10 @@ def create_model_kind(v: t.Any, dialect: str, defaults: t.Dict[str, t.Any]) -> M
             # we dont want to throw an error here because we still want Models with a CustomKind to be able
             # to be serialized / deserialized in contexts where the custom materialization class may not be available,
             # such as in HTTP request handlers
-            if custom_materialization := get_custom_materialization_type(
+            custom_materialization = get_custom_materialization_type(
                 validate_string(props.get("materialization")), raise_errors=False
-            ):
+            )
+            if custom_materialization is not None:
                 actual_kind_type, _ = custom_materialization
                 return actual_kind_type(**props)
 

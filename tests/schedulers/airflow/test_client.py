@@ -107,12 +107,13 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                         "clustered_by": [],
                         "cron": "@daily",
                         "dialect": "spark",
-                        "pre_statements": ["@DEF(key, " "'value')"],
+                        "pre_statements": ["@DEF(key, 'value')"],
                         "kind": {
                             "name": "INCREMENTAL_BY_TIME_RANGE",
                             "time_column": {"column": "`ds`"},
                             "forward_only": False,
                             "on_destructive_change": "ERROR",
+                            "partition_by_time_column": True,
                             "disable_restatement": False,
                             "dialect": "spark",
                         },
@@ -169,6 +170,7 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                 ],
                 "start_at": "2022-01-01",
                 "end_at": "2022-01-01",
+                "gateway_managed": False,
                 "plan_id": "test_plan_id",
                 "previous_plan_id": "previous_plan_id",
                 "promoted_snapshot_ids": [

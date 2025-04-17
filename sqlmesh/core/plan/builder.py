@@ -7,7 +7,7 @@ from collections import defaultdict
 from functools import cached_property
 
 
-from sqlmesh.core.console import Console, get_console
+from sqlmesh.core.console import PlanBuilderConsole, get_console
 from sqlmesh.core.config import (
     AutoCategorizationMode,
     CategorizerConfig,
@@ -106,7 +106,7 @@ class PlanBuilder:
         end_bounded: bool = False,
         ensure_finalized_snapshots: bool = False,
         interval_end_per_model: t.Optional[t.Dict[str, int]] = None,
-        console: t.Optional[Console] = None,
+        console: t.Optional[PlanBuilderConsole] = None,
     ):
         self._context_diff = context_diff
         self._no_gaps = no_gaps
@@ -151,6 +151,7 @@ class PlanBuilder:
             name=self._context_diff.environment,
             suffix_target=environment_suffix_target,
             normalize_name=self._context_diff.normalize_environment_name,
+            gateway_managed=self._context_diff.gateway_managed_virtual_layer,
         )
 
         self._latest_plan: t.Optional[Plan] = None
@@ -495,7 +496,7 @@ class PlanBuilder:
                     dropped_column_names = get_dropped_column_names(schema_diff)
                     model_dialect = snapshot.model.dialect
 
-                    get_console().log_destructive_change(
+                    self._console.log_destructive_change(
                         snapshot_name,
                         dropped_column_names,
                         schema_diff,
@@ -578,21 +579,23 @@ class PlanBuilder:
                     if mode == AutoCategorizationMode.FULL:
                         snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
         elif self._context_diff.indirectly_modified(snapshot.name):
-            categories = []
+            all_upstream_categories = set()
+            direct_parent_categories = set()
 
             for p_id in dag.upstream(s_id):
                 parent = self._context_diff.snapshots.get(p_id)
 
                 if parent and self._is_new_snapshot(parent):
-                    categories.append(parent.change_category)
+                    all_upstream_categories.add(parent.change_category)
+                    if p_id in snapshot.parents:
+                        direct_parent_categories.add(parent.change_category)
 
-            if not categories or any(
-                category.is_breaking or category.is_indirect_breaking
-                for category in categories
-                if category
+            if not direct_parent_categories or direct_parent_categories.intersection(
+                {SnapshotChangeCategory.BREAKING, SnapshotChangeCategory.INDIRECT_BREAKING}
             ):
                 snapshot.categorize_as(SnapshotChangeCategory.INDIRECT_BREAKING)
-            elif any(category.is_forward_only for category in categories if category):
+            elif SnapshotChangeCategory.FORWARD_ONLY in all_upstream_categories:
+                # FORWARD_ONLY must take precedence over INDIRECT_NON_BREAKING
                 snapshot.categorize_as(SnapshotChangeCategory.FORWARD_ONLY)
             else:
                 snapshot.categorize_as(SnapshotChangeCategory.INDIRECT_NON_BREAKING)

@@ -38,14 +38,20 @@ from sqlmesh.utils.date import (
     validate_date_range,
     yesterday,
 )
-from sqlmesh.utils.errors import SQLMeshError
-from sqlmesh.utils.metaprogramming import prepare_env, print_exception
+from sqlmesh.utils.errors import SQLMeshError, SignalEvalError
+from sqlmesh.utils.metaprogramming import (
+    prepare_env,
+    print_exception,
+    format_evaluated_code_exception,
+    Executable,
+)
 from sqlmesh.utils.hashing import hash_data
 from sqlmesh.utils.pydantic import PydanticModel, field_validator
 
 if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core.environment import EnvironmentNamingInfo
+    from sqlmesh.core.context import ExecutionContext
 
 Interval = t.Tuple[int, int]
 Intervals = t.List[Interval]
@@ -329,11 +335,11 @@ class SnapshotInfoMixin(ModelKindMixin):
     base_table_name_override: t.Optional[str]
     dev_table_suffix: str
 
-    @property
+    @cached_property
     def identifier(self) -> str:
         return self.fingerprint.to_identifier()
 
-    @property
+    @cached_property
     def snapshot_id(self) -> SnapshotId:
         return SnapshotId(name=self.name, identifier=self.identifier)
 
@@ -477,9 +483,16 @@ class SnapshotTableInfo(PydanticModel, SnapshotInfoMixin, frozen=True):
     base_table_name_override: t.Optional[str] = None
     custom_materialization: t.Optional[str] = None
     dev_table_suffix: str
+    model_gateway: t.Optional[str] = None
 
     def __lt__(self, other: SnapshotTableInfo) -> bool:
         return self.name < other.name
+
+    def __eq__(self, other: t.Any) -> bool:
+        return isinstance(other, SnapshotTableInfo) and self.fingerprint == other.fingerprint
+
+    def __hash__(self) -> int:
+        return hash((self.__class__, self.name, self.fingerprint))
 
     def table_name(self, is_deployable: bool = True) -> str:
         """Full table name pointing to the materialized location of the snapshot.
@@ -934,7 +947,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             model_end_ts,
         )
 
-    def check_ready_intervals(self, intervals: Intervals) -> Intervals:
+    def check_ready_intervals(self, intervals: Intervals, context: ExecutionContext) -> Intervals:
         """Returns a list of intervals that are considered ready by the provided signal.
 
         Note that this will handle gaps in the provided intervals. The returned intervals
@@ -953,6 +966,8 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                 intervals = _check_ready_intervals(
                     env[signal_name],
                     intervals,
+                    context,
+                    python_env=python_env,
                     dialect=self.model.dialect,
                     path=self.model._path,
                     kwargs=kwargs,
@@ -1171,6 +1186,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             node_type=self.node_type,
             custom_materialization=custom_materialization,
             dev_table_suffix=self.dev_table_suffix,
+            model_gateway=self.model_gateway,
         )
 
     @property
@@ -1235,7 +1251,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     def node_type(self) -> NodeType:
         if self.node.is_model:
             return NodeType.MODEL
-        elif self.node.is_audit:
+        if self.node.is_audit:
             return NodeType.AUDIT
         raise SQLMeshError(f"Snapshot {self.snapshot_id} has an unknown node type.")
 
@@ -1438,21 +1454,24 @@ class DeployabilityIndex(PydanticModel, frozen=True):
     ) -> DeployabilityIndex:
         if not isinstance(snapshots, dict):
             snapshots = {s.snapshot_id: s for s in snapshots}
-        dag = snapshots_to_dag(snapshots.values())
-        reversed_dag = dag.reversed.graph
 
         deployability_mapping: t.Dict[SnapshotId, bool] = {}
+        children_deployability_mapping: t.Dict[SnapshotId, bool] = {}
         representative_shared_version_ids: t.Set[SnapshotId] = set()
 
         start_date_cache: t.Optional[t.Dict[str, datetime]] = {}
 
-        def _visit(node: SnapshotId, deployable: bool = True) -> None:
-            if deployability_mapping.get(node) in (False, deployable) and (
-                deployable or node not in representative_shared_version_ids
-            ):
-                return
-
-            if deployable and node in snapshots:
+        dag = snapshots_to_dag(snapshots.values())
+        for node in dag:
+            if node not in snapshots:
+                continue
+            # Make sure that the node is deployable according to all its parents
+            this_deployable = all(
+                children_deployability_mapping[p_id]
+                for p_id in snapshots[node].parents
+                if p_id in children_deployability_mapping
+            )
+            if this_deployable:
                 snapshot = snapshots[node]
                 is_forward_only_model = snapshot.is_model and snapshot.model.forward_only
                 has_auto_restatement = (
@@ -1481,8 +1500,8 @@ class DeployabilityIndex(PydanticModel, frozen=True):
                     if not snapshot.is_paused or snapshot.is_indirect_non_breaking:
                         # This snapshot represents what's currently deployed in prod.
                         representative_shared_version_ids.add(node)
-                else:
-                    this_deployable = True
+
+                # A child can still be deployable even if its parent is not
                 children_deployable = (
                     is_valid_start
                     and not (
@@ -1491,18 +1510,12 @@ class DeployabilityIndex(PydanticModel, frozen=True):
                     and not has_auto_restatement
                 )
             else:
-                this_deployable, children_deployable = False, False
-                if node in snapshots and not snapshots[node].is_paused:
+                children_deployable = False
+                if not snapshots[node].is_paused:
                     representative_shared_version_ids.add(node)
-                else:
-                    representative_shared_version_ids.discard(node)
 
-            deployability_mapping[node] = deployability_mapping.get(node, True) and this_deployable
-            for child in reversed_dag[node]:
-                _visit(child, children_deployable)
-
-        for node in dag.roots:
-            _visit(node)
+            deployability_mapping[node] = this_deployable
+            children_deployability_mapping[node] = children_deployable
 
         deployable_ids = {
             snapshot_id for snapshot_id, deployable in deployability_mapping.items() if deployable
@@ -1556,6 +1569,15 @@ def display_name(
     Returns the model name as a qualified view name.
     This is just used for presenting information back to the user and `qualified_view_name` should be used
     when wanting a view name in all other cases.
+
+    Args:
+        snapshot_info_like: The snapshot info object to get the display name for
+        environment_naming_info: Environment naming info to use for display name formatting
+        default_catalog: Optional default catalog name to use. If None, the default catalog will always be included in the display name.
+        dialect: Optional dialect type to use for name formatting
+
+    Returns:
+        The formatted display name as a string
     """
     if snapshot_info_like.is_audit:
         return snapshot_info_like.name
@@ -1745,7 +1767,7 @@ def has_paused_forward_only(
 
 
 def missing_intervals(
-    snapshots: t.Collection[Snapshot],
+    snapshots: t.Union[t.Collection[Snapshot], t.Dict[SnapshotId, Snapshot]],
     start: t.Optional[TimeLike] = None,
     end: t.Optional[TimeLike] = None,
     execution_time: t.Optional[TimeLike] = None,
@@ -1756,6 +1778,9 @@ def missing_intervals(
     end_bounded: bool = False,
 ) -> t.Dict[Snapshot, Intervals]:
     """Returns all missing intervals given a collection of snapshots."""
+    if not isinstance(snapshots, dict):
+        # Make sure that the mapping is only constructed once
+        snapshots = {snapshot.snapshot_id: snapshot for snapshot in snapshots}
     missing = {}
     cache: t.Dict[str, datetime] = {}
     end_date = end or now_timestamp()
@@ -1768,7 +1793,7 @@ def missing_intervals(
     interval_end_per_model = interval_end_per_model or {}
     deployability_index = deployability_index or DeployabilityIndex.all_deployable()
 
-    for snapshot in snapshots:
+    for snapshot in snapshots.values():
         if not snapshot.evaluatable:
             continue
         snapshot_start_date = start_dt
@@ -1941,7 +1966,7 @@ def inclusive_exclusive(
 
 
 def earliest_start_date(
-    snapshots: t.Collection[Snapshot],
+    snapshots: t.Union[t.Collection[Snapshot], t.Dict[SnapshotId, Snapshot]],
     cache: t.Optional[t.Dict[str, datetime]] = None,
     relative_to: t.Optional[TimeLike] = None,
 ) -> datetime:
@@ -1956,9 +1981,12 @@ def earliest_start_date(
     """
     cache = {} if cache is None else cache
     if snapshots:
+        if not isinstance(snapshots, dict):
+            # Make sure that the mapping is only constructed once
+            snapshots = {snapshot.snapshot_id: snapshot for snapshot in snapshots}
         return min(
             start_date(snapshot, snapshots, cache=cache, relative_to=relative_to)
-            for snapshot in snapshots
+            for snapshot in snapshots.values()
         )
     return yesterday()
 
@@ -2130,6 +2158,8 @@ def _contiguous_intervals(intervals: Intervals) -> t.List[Intervals]:
 def _check_ready_intervals(
     check: t.Callable,
     intervals: Intervals,
+    context: ExecutionContext,
+    python_env: t.Dict[str, Executable],
     dialect: DialectType = None,
     path: Path = Path(),
     kwargs: t.Optional[t.Dict] = None,
@@ -2140,9 +2170,16 @@ def _check_ready_intervals(
         batch = [(to_datetime(start), to_datetime(end)) for start, end in interval_batch]
 
         try:
-            ready_intervals = call_macro(check, dialect, path, batch, **(kwargs or {}))
-        except Exception:
-            raise SQLMeshError("Error evaluating signal")
+            ready_intervals = call_macro(
+                check,
+                dialect,
+                path,
+                provided_args=(batch,),
+                provided_kwargs=(kwargs or {}),
+                context=context,
+            )
+        except Exception as ex:
+            raise SignalEvalError(format_evaluated_code_exception(ex, python_env))
 
         if isinstance(ready_intervals, bool):
             if not ready_intervals:
@@ -2150,10 +2187,10 @@ def _check_ready_intervals(
         elif isinstance(ready_intervals, list):
             for i in ready_intervals:
                 if i not in batch:
-                    raise SQLMeshError(f"Unknown interval {i} for signal")
+                    raise SignalEvalError(f"Unknown interval {i} for signal")
             batch = ready_intervals
         else:
-            raise SQLMeshError(f"Expected bool | list, got {type(ready_intervals)} for signal")
+            raise SignalEvalError(f"Expected bool | list, got {type(ready_intervals)} for signal")
 
         checked_intervals.extend((to_timestamp(start), to_timestamp(end)) for start, end in batch)
 

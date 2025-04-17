@@ -13,15 +13,28 @@ from sqlmesh.core import dialect as d
 from sqlmesh.core.macros import MacroRegistry, MacroStrTemplate
 from sqlmesh.utils import str_to_bool
 from sqlmesh.utils.errors import ConfigError, SQLMeshError, raise_config_error
-from sqlmesh.utils.metaprogramming import Executable, build_env, prepare_env, serialize_env
+from sqlmesh.utils.metaprogramming import (
+    Executable,
+    SqlValue,
+    build_env,
+    prepare_env,
+    serialize_env,
+)
 from sqlmesh.utils.pydantic import ValidationInfo, field_validator
 
 if t.TYPE_CHECKING:
+    from sqlglot.dialects.dialect import DialectType
+    from sqlmesh.utils import registry_decorator
     from sqlmesh.utils.jinja import MacroReference
+
+    MacroCallable = registry_decorator
 
 
 def make_python_env(
-    expressions: t.Union[exp.Expression, t.List[exp.Expression]],
+    expressions: t.Union[
+        exp.Expression,
+        t.List[t.Union[exp.Expression, t.Tuple[exp.Expression, bool]]],
+    ],
     jinja_macro_references: t.Optional[t.Set[MacroReference]],
     module_path: Path,
     macros: MacroRegistry,
@@ -30,62 +43,92 @@ def make_python_env(
     path: t.Optional[str | Path] = None,
     python_env: t.Optional[t.Dict[str, Executable]] = None,
     strict_resolution: bool = True,
+    blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
+    dialect: DialectType = None,
 ) -> t.Dict[str, Executable]:
     python_env = {} if python_env is None else python_env
     variables = variables or {}
-    env: t.Dict[str, t.Any] = {}
-    used_macros = {}
+    env: t.Dict[str, t.Tuple[t.Any, t.Optional[bool]]] = {}
+    used_macros: t.Dict[
+        str,
+        t.Tuple[t.Union[Executable | MacroCallable], t.Optional[bool]],
+    ] = {}
     used_variables = (used_variables or set()).copy()
 
     expressions = ensure_list(expressions)
-    for expression in expressions:
-        if not isinstance(expression, d.Jinja):
-            for macro_func_or_var in expression.find_all(d.MacroFunc, d.MacroVar, exp.Identifier):
-                if macro_func_or_var.__class__ is d.MacroFunc:
-                    name = macro_func_or_var.this.name.lower()
-                    if name in macros:
-                        used_macros[name] = macros[name]
-                        if name == c.VAR:
-                            args = macro_func_or_var.this.expressions
-                            if len(args) < 1:
-                                raise_config_error("Macro VAR requires at least one argument", path)
-                            if not args[0].is_string:
-                                raise_config_error(
-                                    f"The variable name must be a string literal, '{args[0].sql()}' was given instead",
-                                    path,
-                                )
-                            used_variables.add(args[0].this.lower())
-                elif macro_func_or_var.__class__ is d.MacroVar:
-                    name = macro_func_or_var.name.lower()
-                    if name in macros:
-                        used_macros[name] = macros[name]
-                    elif name in variables:
-                        used_variables.add(name)
-                elif (
-                    isinstance(macro_func_or_var, (exp.Identifier, d.MacroStrReplace, d.MacroSQL))
-                ) and "@" in macro_func_or_var.name:
-                    for _, identifier, braced_identifier, _ in MacroStrTemplate.pattern.findall(
-                        macro_func_or_var.name
-                    ):
-                        var_name = braced_identifier or identifier
-                        if var_name in variables:
-                            used_variables.add(var_name)
+    for expression_metadata in expressions:
+        if isinstance(expression_metadata, tuple):
+            expression, is_metadata = expression_metadata
+        else:
+            expression, is_metadata = expression_metadata, None
+
+        if isinstance(expression, d.Jinja):
+            continue
+
+        for macro_func_or_var in expression.find_all(d.MacroFunc, d.MacroVar, exp.Identifier):
+            if macro_func_or_var.__class__ is d.MacroFunc:
+                name = macro_func_or_var.this.name.lower()
+                if name not in macros:
+                    continue
+
+                # If this macro has been seen before as a non-metadata macro, prioritize that
+                used_macros[name] = (
+                    macros[name],
+                    used_macros.get(name, (None, is_metadata))[1] and is_metadata,
+                )
+                if name == c.VAR:
+                    args = macro_func_or_var.this.expressions
+                    if len(args) < 1:
+                        raise_config_error("Macro VAR requires at least one argument", path)
+                    if not args[0].is_string:
+                        raise_config_error(
+                            f"The variable name must be a string literal, '{args[0].sql()}' was given instead",
+                            path,
+                        )
+                    used_variables.add(args[0].this.lower())
+            elif macro_func_or_var.__class__ is d.MacroVar:
+                name = macro_func_or_var.name.lower()
+                if name in macros:
+                    # If this macro has been seen before as a non-metadata macro, prioritize that
+                    used_macros[name] = (
+                        macros[name],
+                        used_macros.get(name, (None, is_metadata))[1] and is_metadata,
+                    )
+                elif name in variables:
+                    used_variables.add(name)
+            elif (
+                isinstance(macro_func_or_var, (exp.Identifier, d.MacroStrReplace, d.MacroSQL))
+            ) and "@" in macro_func_or_var.name:
+                for _, identifier, braced_identifier, _ in MacroStrTemplate.pattern.findall(
+                    macro_func_or_var.name
+                ):
+                    var_name = braced_identifier or identifier
+                    if var_name in variables:
+                        used_variables.add(var_name)
 
     for macro_ref in jinja_macro_references or set():
         if macro_ref.package is None and macro_ref.name in macros:
-            used_macros[macro_ref.name] = macros[macro_ref.name]
+            used_macros[macro_ref.name] = (macros[macro_ref.name], None)
 
-    for name, used_macro in used_macros.items():
+    for name, (used_macro, is_metadata) in used_macros.items():
         if isinstance(used_macro, Executable):
             python_env[name] = used_macro
         elif not hasattr(used_macro, c.SQLMESH_BUILTIN) and name not in python_env:
-            build_env(used_macro.func, env=env, name=name, path=module_path)
+            build_env(
+                used_macro.func,
+                env=env,
+                name=name,
+                path=module_path,
+                is_metadata_obj=is_metadata,
+            )
 
     python_env.update(serialize_env(env, path=module_path))
     return _add_variables_to_python_env(
         python_env,
         used_variables,
         variables,
+        blueprint_variables=blueprint_variables,
+        dialect=dialect,
         strict_resolution=strict_resolution,
     )
 
@@ -95,6 +138,8 @@ def _add_variables_to_python_env(
     used_variables: t.Optional[t.Set[str]],
     variables: t.Optional[t.Dict[str, t.Any]],
     strict_resolution: bool = True,
+    blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
+    dialect: DialectType = None,
 ) -> t.Dict[str, Executable]:
     _, python_used_variables = parse_dependencies(
         python_env,
@@ -106,6 +151,13 @@ def _add_variables_to_python_env(
     variables = {k: v for k, v in (variables or {}).items() if k in used_variables}
     if variables:
         python_env[c.SQLMESH_VARS] = Executable.value(variables)
+
+    if blueprint_variables:
+        blueprint_variables = {
+            k: SqlValue(sql=v.sql(dialect=dialect)) if isinstance(v, exp.Expression) else v
+            for k, v in blueprint_variables.items()
+        }
+        python_env[c.SQLMESH_BLUEPRINT_VARS] = Executable.value(blueprint_variables)
 
     return python_env
 
@@ -300,6 +352,19 @@ def depends_on(cls: t.Type, v: t.Any, info: ValidationInfo) -> t.Optional[t.Set[
     return v
 
 
+def sort_python_env(python_env: t.Dict[str, Executable]) -> t.List[t.Tuple[str, Executable]]:
+    """Returns the python env sorted."""
+    return sorted(python_env.items(), key=lambda x: (x[1].kind, x[0]))
+
+
+def sorted_python_env_payloads(python_env: t.Dict[str, Executable]) -> t.List[str]:
+    """Returns the payloads of the sorted python env."""
+    return [
+        v.payload if v.is_import or v.is_definition else f"{k} = {v.payload}"
+        for k, v in sort_python_env(python_env)
+    ]
+
+
 expression_validator: t.Callable = field_validator(
     "query",
     "expressions_",
@@ -321,7 +386,6 @@ bool_validator: t.Callable = field_validator(
     "allow_partials",
     "enabled",
     "optimize_query",
-    "validate_query",
     mode="before",
     check_fields=False,
 )(parse_bool)

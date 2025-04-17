@@ -37,6 +37,7 @@ from sqlmesh.core.snapshot import (
     SnapshotInfoLike,
     SnapshotTableInfo,
 )
+from sqlmesh.utils import CompletionStatus
 from sqlmesh.core.state_sync import StateSync
 from sqlmesh.core.state_sync.base import PromotionResult
 from sqlmesh.core.user import User
@@ -133,30 +134,38 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 execution_time=plan.execution_time,
             )
 
-            self._push(plan, snapshots, deployability_index_for_creation)
+            push_completion_status = self._push(plan, snapshots, deployability_index_for_creation)
+            if push_completion_status.is_nothing_to_do:
+                self.console.log_status_update(
+                    "\n[green]SKIP: No physical layer updates to perform[/green]\n"
+                )
             update_intervals_for_new_snapshots(plan.new_snapshots, self.state_sync)
             self._restate(plan, snapshots_by_name)
-            self._backfill(
+            first_bf_completion_status = self._backfill(
                 plan,
                 snapshots_by_name,
                 before_promote_snapshots,
                 deployability_index_for_evaluation,
                 circuit_breaker=circuit_breaker,
             )
-            promotion_result = self._promote(plan, snapshots, before_promote_snapshots)
-            self._backfill(
+            promotion_result = self._promote(
+                plan, snapshots, before_promote_snapshots, deployability_index_for_creation
+            )
+            second_bf_completion_status = self._backfill(
                 plan,
                 snapshots_by_name,
                 after_promote_snapshots,
                 deployability_index_for_evaluation,
                 circuit_breaker=circuit_breaker,
             )
+            if (
+                first_bf_completion_status.is_nothing_to_do
+                and second_bf_completion_status.is_nothing_to_do
+            ):
+                self.console.log_status_update("[green]SKIP: No model batches to execute[/green]\n")
             self._update_views(
                 plan, snapshots, promotion_result, deployability_index_for_evaluation
             )
-
-            if not plan.requires_backfill:
-                self.console.log_success("Virtual Update executed successfully")
 
             execute_environment_statements(
                 adapter=self.snapshot_evaluator.adapter,
@@ -185,7 +194,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         selected_snapshots: t.Set[str],
         deployability_index: DeployabilityIndex,
         circuit_breaker: t.Optional[t.Callable[[], bool]] = None,
-    ) -> None:
+    ) -> CompletionStatus:
         """Backfill missing intervals for snapshots that are part of the given plan.
 
         Args:
@@ -195,7 +204,12 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         if plan.empty_backfill:
             intervals_to_add = []
             for snapshot in snapshots_by_name.values():
-                intervals = [snapshot.inclusive_exclusive(plan.start, plan.end, strict=False)]
+                if not snapshot.evaluatable or not plan.is_selected_for_backfill(snapshot.name):
+                    # Skip snapshots that are not evaluatable or not selected for backfill.
+                    continue
+                intervals = [
+                    snapshot.inclusive_exclusive(plan.start, plan.end, strict=False, expand=False)
+                ]
                 is_deployable = deployability_index.is_deployable(snapshot)
                 intervals_to_add.append(
                     SnapshotIntervals(
@@ -208,10 +222,10 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                     )
                 )
             self.state_sync.add_snapshots_intervals(intervals_to_add)
-            return
+            return CompletionStatus.NOTHING_TO_DO
 
         if not plan.requires_backfill or not selected_snapshots:
-            return
+            return CompletionStatus.NOTHING_TO_DO
 
         scheduler = self.create_scheduler(snapshots_by_name.values())
         completion_status = scheduler.run(
@@ -232,12 +246,14 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         if completion_status.is_failure:
             raise PlanError("Plan application failed.")
 
+        return completion_status
+
     def _push(
         self,
         plan: EvaluatablePlan,
         snapshots: t.Dict[SnapshotId, Snapshot],
         deployability_index: t.Optional[DeployabilityIndex] = None,
-    ) -> None:
+    ) -> CompletionStatus:
         """Push the snapshots to the state sync.
 
         As a part of plan pushing, snapshot tables are created.
@@ -264,10 +280,10 @@ class BuiltInPlanEvaluator(PlanEvaluator):
 
         snapshots_to_create = [s for s in snapshots.values() if _should_create(s)]
 
-        completed = False
+        completion_status = None
         progress_stopped = False
         try:
-            self.snapshot_evaluator.create(
+            completion_status = self.snapshot_evaluator.create(
                 snapshots_to_create,
                 snapshots,
                 allow_destructive_snapshots=plan.allow_destructive_models,
@@ -277,7 +293,6 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 ),
                 on_complete=self.console.update_creation_progress,
             )
-            completed = True
         except NodeExecutionFailedError as ex:
             self.console.stop_creation_progress(success=False)
             progress_stopped = True
@@ -288,19 +303,23 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             raise PlanError("Plan application failed.")
         finally:
             if not progress_stopped:
-                self.console.stop_creation_progress(success=completed)
+                self.console.stop_creation_progress(
+                    success=completion_status is not None and completion_status.is_success
+                )
 
         self.state_sync.push_snapshots(plan.new_snapshots)
 
         analytics.collector.on_snapshots_created(
             new_snapshots=plan.new_snapshots, plan_id=plan.plan_id
         )
+        return completion_status
 
     def _promote(
         self,
         plan: EvaluatablePlan,
         snapshots: t.Dict[SnapshotId, Snapshot],
         no_gaps_snapshot_names: t.Optional[t.Set[str]] = None,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
     ) -> PromotionResult:
         """Promote a plan.
 
@@ -320,7 +339,8 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 self.snapshot_evaluator.migrate(
                     [s for s in snapshots.values() if s.is_paused],
                     snapshots,
-                    plan.allow_destructive_models,
+                    allow_destructive_snapshots=plan.allow_destructive_models,
+                    deployability_index=deployability_index,
                 )
             except NodeExecutionFailedError as ex:
                 raise PlanError(str(ex.__cause__) if ex.__cause__ else str(ex))
@@ -356,7 +376,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         environment = plan.environment
 
         self.console.start_promotion_progress(
-            len(promotion_result.added) + len(promotion_result.removed),
+            promotion_result.added + promotion_result.removed,
             environment.naming_info,
             self.default_catalog,
         )
@@ -438,7 +458,9 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         # Without this rule, its possible that promoting a dev table to prod will introduce old data to prod
         snapshot_intervals_to_restate.update(
             self._restatement_intervals_across_all_environments(
-                plan.restatements, plan.disabled_restatement_models
+                prod_restatements=plan.restatements,
+                disable_restatement_models=plan.disabled_restatement_models,
+                loaded_snapshots={s.snapshot_id: s for s in snapshots_by_name.values()},
             )
         )
 
@@ -448,7 +470,10 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         )
 
     def _restatement_intervals_across_all_environments(
-        self, prod_restatements: t.Dict[str, Interval], disable_restatement_models: t.Set[str]
+        self,
+        prod_restatements: t.Dict[str, Interval],
+        disable_restatement_models: t.Set[str],
+        loaded_snapshots: t.Dict[SnapshotId, Snapshot],
     ) -> t.Set[t.Tuple[SnapshotTableInfo, Interval]]:
         """
         Given a map of snapshot names + intervals to restate in prod:
@@ -462,7 +487,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         if not prod_restatements:
             return set()
 
-        snapshots_to_restate: t.Set[t.Tuple[SnapshotTableInfo, Interval]] = set()
+        snapshots_to_restate: t.Dict[SnapshotId, t.Tuple[SnapshotTableInfo, Interval]] = {}
 
         for env in self.state_sync.get_environments():
             keyed_snapshots = {s.name: s.table_info for s in env.snapshots}
@@ -480,10 +505,48 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                     if x not in disable_restatement_models
                 ]
                 snapshots_to_restate.update(
-                    {(keyed_snapshots[a], intervals) for a in affected_snapshot_names}
+                    {
+                        keyed_snapshots[a].snapshot_id: (keyed_snapshots[a], intervals)
+                        for a in affected_snapshot_names
+                    }
                 )
 
-        return snapshots_to_restate
+        # for any affected full_history_restatement_only snapshots, we need to widen the intervals being restated to
+        # include the whole time range for that snapshot. This requires a call to state to load the full snapshot record,
+        # so we only do it if necessary
+        full_history_restatement_snapshot_ids = [
+            # FIXME: full_history_restatement_only is just one indicator that the snapshot can only be fully refreshed, the other one is Model.depends_on_self
+            # however, to figure out depends_on_self, we have to render all the model queries which, alongside having to fetch full snapshots from state,
+            # is problematic in secure environments that are deliberately isolated from arbitrary user code (since rendering a query may require user macros to be present)
+            # So for now, these are not considered
+            s_id
+            for s_id, s in snapshots_to_restate.items()
+            if s[0].full_history_restatement_only
+        ]
+        if full_history_restatement_snapshot_ids:
+            # only load full snapshot records that we havent already loaded
+            additional_snapshots = self.state_sync.get_snapshots(
+                [
+                    s.snapshot_id
+                    for s in full_history_restatement_snapshot_ids
+                    if s.snapshot_id not in loaded_snapshots
+                ]
+            )
+
+            all_snapshots = loaded_snapshots | additional_snapshots
+
+            for full_snapshot_id in full_history_restatement_snapshot_ids:
+                full_snapshot = all_snapshots[full_snapshot_id]
+                _, original_intervals = snapshots_to_restate[full_snapshot_id]
+                original_start, original_end = original_intervals
+
+                # get_removal_interval() widens intervals if necessary
+                new_intervals = full_snapshot.get_removal_interval(
+                    start=original_start, end=original_end
+                )
+                snapshots_to_restate[full_snapshot_id] = (full_snapshot.table_info, new_intervals)
+
+        return set(snapshots_to_restate.values())
 
 
 class BaseAirflowPlanEvaluator(PlanEvaluator):

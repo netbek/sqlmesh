@@ -25,9 +25,11 @@ from sqlmesh.core.config.connection import (
 from sqlmesh.core.config.feature_flag import FeatureFlag
 from sqlmesh.core.config.format import FormatConfig
 from sqlmesh.core.config.gateway import GatewayConfig
+from sqlmesh.core.config.janitor import JanitorConfig
 from sqlmesh.core.config.migration import MigrationConfig
 from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.config.naming import NameInferenceConfig as NameInferenceConfig
+from sqlmesh.core.config.linter import LinterConfig as LinterConfig
 from sqlmesh.core.config.plan import PlanConfig
 from sqlmesh.core.config.run import RunConfig
 from sqlmesh.core.config.scheduler import (
@@ -71,6 +73,7 @@ class Config(BaseConfig):
         model_defaults: Default values for model definitions.
         physical_schema_mapping: A mapping from regular expressions to names of schemas in which physical tables for corresponding models will be placed.
         environment_suffix_target: Indicates whether to append the environment name to the schema or table name.
+        gateway_managed_virtual_layer: Whether the models' views in the virtual layer are created by the model-specific gateway rather than the default gateway.
         environment_catalog_mapping: A mapping from regular expressions to catalog names. The catalog name is used to determine the target catalog for a given environment.
         default_target_environment: The name of the environment that will be the default target for the `sqlmesh plan` and `sqlmesh run` commands.
         log_limit: The default number of logs to keep.
@@ -109,6 +112,7 @@ class Config(BaseConfig):
     environment_suffix_target: EnvironmentSuffixTarget = Field(
         default=EnvironmentSuffixTarget.default
     )
+    gateway_managed_virtual_layer: bool = False
     environment_catalog_mapping: t.Dict[re.Pattern, str] = {}
     default_target_environment: str = c.PROD
     log_limit: int = c.DEFAULT_LOG_LIMIT
@@ -124,6 +128,8 @@ class Config(BaseConfig):
     disable_anonymized_analytics: bool = False
     before_all: t.Optional[t.List[str]] = None
     after_all: t.Optional[t.List[str]] = None
+    linter: LinterConfig = LinterConfig()
+    janitor: JanitorConfig = JanitorConfig()
 
     _FIELD_UPDATE_STRATEGY: t.ClassVar[t.Dict[str, UpdateStrategy]] = {
         "gateways": UpdateStrategy.NESTED_UPDATE,
@@ -141,10 +147,11 @@ class Config(BaseConfig):
         "plan": UpdateStrategy.NESTED_UPDATE,
         "before_all": UpdateStrategy.EXTEND,
         "after_all": UpdateStrategy.EXTEND,
+        "linter": UpdateStrategy.NESTED_UPDATE,
     }
 
     _connection_config_validator = connection_config_validator
-    _scheduler_config_validator = scheduler_config_validator
+    _scheduler_config_validator = scheduler_config_validator  # type: ignore
     _variables_validator = variables_validator
 
     @field_validator("gateways", mode="before")
@@ -252,12 +259,9 @@ class Config(BaseConfig):
                 raise ConfigError(f"Missing gateway with name '{name}'.")
 
             return self.gateways[name]
-        else:
-            if name is not None:
-                raise ConfigError(
-                    "Gateway name is not supported when only one gateway is configured."
-                )
-            return self.gateways
+        if name is not None:
+            raise ConfigError("Gateway name is not supported when only one gateway is configured.")
+        return self.gateways
 
     def get_connection(self, gateway_name: t.Optional[str] = None) -> ConnectionConfig:
         return self.get_gateway(gateway_name).connection or self.default_connection

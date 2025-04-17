@@ -35,6 +35,7 @@ Configuration options for SQLMesh environment creation and promotion.
 | `physical_schema_override`    | (Deprecated) Use `physical_schema_mapping` instead. A mapping from model schema names to names of schemas in which physical tables for the corresponding models will be placed.                                                                                                                    | dict[string, string] | N        |
 | `physical_schema_mapping`     | A mapping from regular expressions to names of schemas in which physical tables for the corresponding models [will be placed](../guides/configuration.md#physical-table-schemas). (Default physical schema name: `sqlmesh__[model schema]`)                                                        | dict[string, string] | N        |
 | `environment_suffix_target`   | Whether SQLMesh views should append their environment name to the `schema` or `table` - [additional details](../guides/configuration.md#view-schema-override). (Default: `schema`)                                                                                                                 | string               | N        |
+| `gateway_managed_virtual_layer`   | Whether SQLMesh views of the virtual layer will be created by the default gateway or model specified gateways - [additional details](../guides/configuration.md#view-schema-override). (Default: False)                                                                                                                 | boolean               | N        |
 | `environment_catalog_mapping` | A mapping from regular expressions to catalog names. The catalog name is used to determine the target catalog for a given environment.                                                                                                                                                             | dict[string, string] | N        |
 | `log_limit`                   | The default number of logs to keep (Default: `20`)                                                                                                                                                                                                                                                 | int                  | N        |
 
@@ -102,6 +103,16 @@ Formatting settings for the `sqlmesh format` command and UI.
 | `max_text_width`      | The maximum text width in a segment before creating new lines (Default: 80)                    |   int   |    N     |
 | `append_newline`      | Whether to append a newline to the end of the file (Default: False)                            | boolean |    N     |
 | `no_rewrite_casts`    | Preserve the existing casts, without rewriting them to use the :: syntax. (Default: False)                  | boolean |    N     |
+
+
+## Janitor
+
+Configuration for the `sqlmesh janitor` command.
+
+| Option                   | Description                                                                                                                | Type    | Required |
+|--------------------------|----------------------------------------------------------------------------------------------------------------------------|:-------:|:--------:|
+| `warn_on_delete_failure` | Whether to warn instead of erroring if the janitor fails to delete the expired environment schema / views (Default: False) | boolean | N        |
+
 
 ## UI
 

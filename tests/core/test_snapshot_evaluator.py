@@ -1169,11 +1169,10 @@ def test_migrate(mocker: MockerFixture, make_snapshot):
                 "c": exp.DataType.build("int"),
                 "b": exp.DataType.build("int"),
             }
-        else:
-            return {
-                "c": exp.DataType.build("int"),
-                "a": exp.DataType.build("int"),
-            }
+        return {
+            "c": exp.DataType.build("int"),
+            "a": exp.DataType.build("int"),
+        }
 
     adapter.columns = columns  # type: ignore
     adapter.table_exists = lambda _: True  # type: ignore
@@ -1191,7 +1190,7 @@ def test_migrate(mocker: MockerFixture, make_snapshot):
     snapshot = make_snapshot(model, version="1")
     snapshot.change_category = SnapshotChangeCategory.FORWARD_ONLY
 
-    evaluator.migrate([snapshot], {})
+    evaluator.migrate([snapshot], {}, deployability_index=DeployabilityIndex.none_deployable())
 
     cursor_mock.execute.assert_has_calls(
         [
@@ -1226,7 +1225,7 @@ def test_migrate_missing_table(mocker: MockerFixture, make_snapshot):
     snapshot = make_snapshot(model, version="1")
     snapshot.change_category = SnapshotChangeCategory.FORWARD_ONLY
 
-    evaluator.migrate([snapshot], {})
+    evaluator.migrate([snapshot], {}, deployability_index=DeployabilityIndex.none_deployable())
 
     cursor_mock.execute.assert_has_calls(
         [
@@ -1262,7 +1261,7 @@ def test_migrate_view(
     snapshot = make_snapshot(model, version="1")
     snapshot.change_category = change_category
 
-    evaluator.migrate([snapshot], {})
+    evaluator.migrate([snapshot], {}, deployability_index=DeployabilityIndex.none_deployable())
 
     cursor_mock.execute.assert_has_calls(
         [
@@ -1504,6 +1503,7 @@ def test_create_clone_in_dev(mocker: MockerFixture, adapter_mock, make_snapshot)
         f"sqlmesh__test_schema.test_schema__test_model__{snapshot.version}__dev",
         f"sqlmesh__test_schema.test_schema__test_model__{snapshot.version}",
         replace=True,
+        rendered_physical_properties={},
     )
 
     adapter_mock.get_alter_expressions.assert_called_once_with(
@@ -1602,6 +1602,7 @@ def test_drop_clone_in_dev_when_migration_fails(mocker: MockerFixture, adapter_m
         f"sqlmesh__test_schema.test_schema__test_model__{snapshot.version}__dev",
         f"sqlmesh__test_schema.test_schema__test_model__{snapshot.version}",
         replace=True,
+        rendered_physical_properties={},
     )
 
     adapter_mock.get_alter_expressions.assert_called_once_with(
@@ -1702,11 +1703,10 @@ def test_on_destructive_change_runtime_check(
                 "c": exp.DataType.build("int"),
                 "b": exp.DataType.build("int"),
             }
-        else:
-            return {
-                "c": exp.DataType.build("int"),
-                "a": exp.DataType.build("int"),
-            }
+        return {
+            "c": exp.DataType.build("int"),
+            "a": exp.DataType.build("int"),
+        }
 
     adapter.columns = columns  # type: ignore
 
@@ -1722,7 +1722,7 @@ def test_on_destructive_change_runtime_check(
     snapshot.change_category = SnapshotChangeCategory.FORWARD_ONLY
 
     with pytest.raises(NodeExecutionFailedError) as ex:
-        evaluator.migrate([snapshot], {})
+        evaluator.migrate([snapshot], {}, deployability_index=DeployabilityIndex.none_deployable())
 
     destructive_change_err = ex.value.__cause__
     assert isinstance(destructive_change_err, DestructiveChangeError)
@@ -1744,7 +1744,7 @@ def test_on_destructive_change_runtime_check(
 
     logger = logging.getLogger("sqlmesh.core.snapshot.evaluator")
     with patch.object(logger, "warning") as mock_logger:
-        evaluator.migrate([snapshot], {})
+        evaluator.migrate([snapshot], {}, deployability_index=DeployabilityIndex.none_deployable())
         assert (
             mock_logger.call_args[0][0]
             == "\nPlan requires a destructive change to forward-only model '\"test_schema\".\"test_model\"'s schema that drops column 'b'.\n\nSchema changes:\n  ALTER TABLE sqlmesh__test_schema.test_schema__test_model__1 DROP COLUMN b\n  ALTER TABLE sqlmesh__test_schema.test_schema__test_model__1 ADD COLUMN a INT"
@@ -1752,7 +1752,12 @@ def test_on_destructive_change_runtime_check(
 
     # allow destructive
     with patch.object(logger, "warning") as mock_logger:
-        evaluator.migrate([snapshot], {}, {'"test_schema"."test_model"'})
+        evaluator.migrate(
+            [snapshot],
+            {},
+            {'"test_schema"."test_model"'},
+            deployability_index=DeployabilityIndex.none_deployable(),
+        )
         assert mock_logger.call_count == 0
 
 
@@ -1963,6 +1968,7 @@ def test_insert_into_scd_type_2_by_time(
         target_table=snapshot.table_name(),
         source_table=model.render_query(),
         columns_to_types=table_columns,
+        table_format=None,
         unique_key=[exp.to_column("id", quoted=True)],
         valid_from_col=exp.column("valid_from", quoted=True),
         valid_to_col=exp.column("valid_to", quoted=True),
@@ -2134,6 +2140,7 @@ def test_insert_into_scd_type_2_by_column(
         target_table=snapshot.table_name(),
         source_table=model.render_query(),
         columns_to_types=table_columns,
+        table_format=None,
         unique_key=[exp.to_column("id", quoted=True)],
         check_columns=exp.Star(),
         valid_from_col=exp.column("valid_from", quoted=True),
@@ -2710,7 +2717,7 @@ def test_audit_wap(adapter_mock, make_snapshot):
     not_null_query = call_args[0][0][0]
     assert (
         not_null_query.sql(dialect="spark")
-        == "SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM `spark_catalog`.`test_schema`.`test_table`.`branch_wap_test_wap_id` AS `branch_wap_test_wap_id`) AS `_q_0` WHERE `a` IS NULL AND TRUE) AS audit"
+        == "SELECT COUNT(*) FROM (SELECT * FROM `spark_catalog`.`test_schema`.`test_table`.`branch_wap_test_wap_id` AS `branch_wap_test_wap_id` WHERE `a` IS NULL AND TRUE) AS audit"
     )
 
     custom_audit_query = call_args[1][0][0]
@@ -2752,7 +2759,7 @@ def test_audit_with_datetime_macros(adapter_mock, make_snapshot):
     unique_combination_of_columns_query = call_args[0][0][0]
     assert (
         unique_combination_of_columns_query.sql(dialect="duckdb")
-        == """SELECT COUNT(*) FROM (SELECT "a" AS "a" FROM (SELECT * FROM "test_schema"."test_table" AS "test_table") AS "_q_0" WHERE '2020-01-01' <> '2020-01-01' GROUP BY "a" HAVING COUNT(*) > 1) AS audit"""
+        == """SELECT COUNT(*) FROM (SELECT "a" AS "a" FROM "test_schema"."test_table" AS "test_table" WHERE '2020-01-01' <> '2020-01-01' GROUP BY "a" HAVING COUNT(*) > 1) AS audit"""
     )
 
 
@@ -2919,6 +2926,10 @@ def test_create_pre_post_statements_python_model(
 def test_on_virtual_update_statements(mocker: MockerFixture, adapter_mock, make_snapshot):
     evaluator = SnapshotEvaluator(adapter_mock)
 
+    @macro()
+    def create_log_table(evaluator, view_name):
+        return f"CREATE OR REPLACE TABLE log_table AS SELECT '{view_name}' as fqn_this_model, '{evaluator.this_model}' as eval_this_model"
+
     model = load_sql_based_model(
         d.parse(
             """
@@ -2937,6 +2948,7 @@ def test_on_virtual_update_statements(mocker: MockerFixture, adapter_mock, make_
             GRANT SELECT ON VIEW test_schema.test_model TO ROLE admin;
             JINJA_END;
             GRANT REFERENCES, SELECT ON FUTURE VIEWS IN DATABASE demo_db TO ROLE owner_name;
+            @create_log_table(@this_model);
             ON_VIRTUAL_UPDATE_END;
 
             """
@@ -2986,6 +2998,12 @@ def test_on_virtual_update_statements(mocker: MockerFixture, adapter_mock, make_
     assert (
         on_virtual_update_calls[1].sql(dialect="postgres")
         == "GRANT REFERENCES, SELECT ON FUTURE VIEWS IN DATABASE demo_db TO ROLE owner_name"
+    )
+
+    # Validation that within the macro the environment specific view is used
+    assert (
+        on_virtual_update_calls[2].sql(dialect="postgres")
+        == 'CREATE OR REPLACE TABLE "log_table" AS SELECT \'"test_schema__test_env"."test_model" /* test_schema.test_model */\' AS "fqn_this_model", \'"test_schema__test_env"."test_model"\' AS "eval_this_model"'
     )
 
 
@@ -3181,8 +3199,8 @@ def test_custom_materialization_strategy(adapter_mock, make_snapshot):
 def test_custom_materialization_strategy_with_custom_properties(adapter_mock, make_snapshot):
     custom_insert_kind = None
 
-    class TestCustomKind(CustomKind):  # type: ignore[no-untyped-def]
-        _primary_key: t.List[exp.Expression]
+    class TestCustomKind(CustomKind):
+        _primary_key: t.List[exp.Expression]  # type: ignore[no-untyped-def]
 
         @model_validator(mode="after")
         def _validate_model(self) -> Self:
@@ -3627,7 +3645,7 @@ def test_migrate_snapshot(snapshot: Snapshot, mocker: MockerFixture, adapter_moc
     assert new_snapshot.table_name() == snapshot.table_name()
 
     evaluator.create([new_snapshot], {})
-    evaluator.migrate([new_snapshot], {})
+    evaluator.migrate([new_snapshot], {}, deployability_index=DeployabilityIndex.none_deployable())
 
     common_kwargs: t.Dict[str, t.Any] = dict(
         table_format=None,
@@ -3695,7 +3713,11 @@ def test_migrate_managed(adapter_mock, make_snapshot, mocker: MockerFixture):
 
     # no schema changes - no-op
     adapter_mock.get_alter_expressions.return_value = []
-    evaluator.migrate(target_snapshots=[snapshot], snapshots={})
+    evaluator.migrate(
+        target_snapshots=[snapshot],
+        snapshots={},
+        deployability_index=DeployabilityIndex.none_deployable(),
+    )
 
     adapter_mock.create_table.assert_not_called()
     adapter_mock.create_managed_table.assert_not_called()
@@ -3705,7 +3727,11 @@ def test_migrate_managed(adapter_mock, make_snapshot, mocker: MockerFixture):
     adapter_mock.get_alter_expressions.return_value = [exp.Alter()]
 
     with pytest.raises(NodeExecutionFailedError) as ex:
-        evaluator.migrate(target_snapshots=[snapshot], snapshots={})
+        evaluator.migrate(
+            target_snapshots=[snapshot],
+            snapshots={},
+            deployability_index=DeployabilityIndex.none_deployable(),
+        )
 
     sqlmesh_err = ex.value.__cause__
     assert isinstance(sqlmesh_err, SQLMeshError)
@@ -3725,9 +3751,9 @@ def test_multiple_engine_creation(snapshot: Snapshot, adapters, make_snapshot):
 
     assert len(evaluator.adapters) == 3
     assert evaluator.adapter == engine_adapters["default"]
-    assert evaluator._get_adapter() == engine_adapters["default"]
-    assert evaluator._get_adapter("third") == engine_adapters["third"]
-    assert evaluator._get_adapter("secondary") == engine_adapters["secondary"]
+    assert evaluator.get_adapter() == engine_adapters["default"]
+    assert evaluator.get_adapter("third") == engine_adapters["third"]
+    assert evaluator.get_adapter("secondary") == engine_adapters["secondary"]
 
     model = load_sql_based_model(
         parse(  # type: ignore
@@ -3866,11 +3892,10 @@ def test_multiple_engine_migration(mocker: MockerFixture, adapter_mock, make_sna
                 "c": exp.DataType.build("int"),
                 "b": exp.DataType.build("int"),
             }
-        else:
-            return {
-                "c": exp.DataType.build("int"),
-                "a": exp.DataType.build("int"),
-            }
+        return {
+            "c": exp.DataType.build("int"),
+            "a": exp.DataType.build("int"),
+        }
 
     adapter.columns = columns  # type: ignore
     adapter_mock.columns = columns  # type: ignore
@@ -3896,7 +3921,9 @@ def test_multiple_engine_migration(mocker: MockerFixture, adapter_mock, make_sna
     )
     snapshot_2 = make_snapshot(model_2, version="1")
     snapshot_2.change_category = SnapshotChangeCategory.FORWARD_ONLY
-    evaluator.migrate([snapshot_1, snapshot_2], {})
+    evaluator.migrate(
+        [snapshot_1, snapshot_2], {}, deployability_index=DeployabilityIndex.none_deployable()
+    )
 
     cursor_mock.execute.assert_has_calls(
         [
@@ -3942,13 +3969,11 @@ def test_multiple_engine_cleanup(snapshot: Snapshot, adapters, make_snapshot):
         f"sqlmesh__test_schema.test_schema__test_model__{snapshot_2.version}",
     )
 
-    snapshot_gateways = {snapshot.name: "default", snapshot_2.name: "secondary"}
     evaluator.cleanup(
         [
             SnapshotTableCleanupTask(snapshot=snapshot.table_info, dev_table_only=True),
             SnapshotTableCleanupTask(snapshot=snapshot_2.table_info, dev_table_only=True),
         ],
-        snapshot_gateways,
     )
 
     # The clean up will happen using the specific gateway the model was created with
@@ -4013,7 +4038,8 @@ def test_multi_engine_python_model_with_macros(adapters, make_snapshot):
     assert len(create_args) == 1
     assert create_args[0][0] == (f"sqlmesh__db.db__multi_engine_test_model__{snapshot.version}",)
 
-    evaluator.promote([snapshot], EnvironmentNamingInfo(name="test_env"))
+    environment_naming_info = EnvironmentNamingInfo(name="test_env")
+    evaluator.promote([snapshot], environment_naming_info)
 
     # Verify that the default gateway creates the view for the virtual layer
     engine_adapters["secondary"].create_view.assert_not_called()
@@ -4028,3 +4054,85 @@ def test_multi_engine_python_model_with_macros(adapters, make_snapshot):
     # Validate that the get_catalog_type method was called only on the secondary engine from the macro evaluator
     engine_adapters["default"].get_catalog_type.assert_not_called()
     assert len(engine_adapters["secondary"].get_catalog_type.call_args_list) == 2
+
+    evaluator.demote([snapshot], environment_naming_info)
+    engine_adapters["default"].drop_view.assert_called_once_with(
+        "db__test_env.multi_engine_test_model",
+        cascade=False,
+    )
+
+    environment_naming_info_gw = EnvironmentNamingInfo(name="test_env", gateway_managed=True)
+    # Validate that promoting with gateway_managed leads to this gateway being used for virtual layer
+    evaluator.promote([snapshot], environment_naming_info_gw)
+    view_args = engine_adapters["secondary"].create_view.call_args_list
+    assert len(view_args) == 1
+    assert view_args[0][0][0] == "db__test_env.multi_engine_test_model"
+
+    # Similarly for demotion
+    evaluator.demote([snapshot], environment_naming_info_gw)
+    engine_adapters["secondary"].drop_view.assert_called_once_with(
+        "db__test_env.multi_engine_test_model",
+        cascade=False,
+    )
+
+
+def test_multiple_engine_virtual_layer(snapshot: Snapshot, adapters, make_snapshot):
+    engine_adapters = {"default": adapters[0], "secondary": adapters[1], "third": adapters[2]}
+    evaluator = SnapshotEvaluator(engine_adapters)
+
+    model = load_sql_based_model(
+        parse(  # type: ignore
+            """
+            MODEL (
+                name test_schema.test_model,
+                kind FULL,
+                gateway secondary,
+                dialect postgres,
+            );
+            SELECT a::int FROM tbl;
+            CREATE INDEX IF NOT EXISTS test_idx ON test_schema.test_model(a);
+            """
+        ),
+    )
+
+    snapshot_2 = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    snapshot_2.categorize_as(SnapshotChangeCategory.BREAKING)
+    evaluator.create([snapshot_2, snapshot], {}, DeployabilityIndex.all_deployable())
+
+    # Default gateway adapter to create table without gateway
+    create_args = engine_adapters["default"].create_table.call_args_list
+    assert len(create_args) == 1
+    assert create_args[0][0] == (f"sqlmesh__db.db__model__{snapshot.version}",)
+
+    # Secondary gateway for gateway-specicied model
+    create_args_2 = engine_adapters["secondary"].create_table.call_args_list
+    assert len(create_args_2) == 1
+    assert create_args_2[0][0] == (
+        f"sqlmesh__test_schema.test_schema__test_model__{snapshot_2.version}",
+    )
+
+    environment_naming_info = EnvironmentNamingInfo(name="test_env", gateway_managed=True)
+    engine_adapters["third"].create_table.assert_not_called()
+    evaluator.promote([snapshot, snapshot_2], environment_naming_info)
+
+    # Virtual layer will use the model-specified gateway adapter for the second model and default otherwise
+    view_args_default = engine_adapters["default"].create_view.call_args_list
+    engine_adapters["third"].create_view.assert_not_called()
+    view_args_secondary = engine_adapters["secondary"].create_view.call_args_list
+
+    assert len(view_args_default) == 1
+    assert view_args_default[0][0][0] == "db__test_env.model"
+    assert len(view_args_secondary) == 1
+    assert view_args_secondary[0][0][0] == "test_schema__test_env.test_model"
+
+    # Demotion will follow with the same pattern
+    evaluator.demote([snapshot_2, snapshot], environment_naming_info)
+    engine_adapters["default"].drop_view.assert_called_once_with(
+        "db__test_env.model",
+        cascade=False,
+    )
+    engine_adapters["secondary"].drop_view.assert_called_once_with(
+        "test_schema__test_env.test_model",
+        cascade=False,
+    )

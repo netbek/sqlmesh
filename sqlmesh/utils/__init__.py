@@ -16,6 +16,7 @@ import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
+from enum import IntEnum, Enum
 from functools import lru_cache, reduce, wraps
 from pathlib import Path
 
@@ -176,8 +177,7 @@ def sys_path(*paths: Path) -> t.Iterator[None]:
 def format_exception(exception: BaseException) -> t.List[str]:
     if sys.version_info < (3, 10):
         return traceback.format_exception(type(exception), exception, exception.__traceback__)  # type: ignore
-    else:
-        return traceback.format_exception(exception)  # type: ignore
+    return traceback.format_exception(exception)  # type: ignore
 
 
 def word_characters_only(s: str, replacement_char: str = "_") -> str:
@@ -338,3 +338,41 @@ def type_is_known(d_type: t.Union[exp.DataType, exp.ColumnDef]) -> bool:
 def columns_to_types_all_known(columns_to_types: t.Dict[str, exp.DataType]) -> bool:
     """Checks that all column types are known and not NULL."""
     return all(type_is_known(expression) for expression in columns_to_types.values())
+
+
+class Verbosity(IntEnum):
+    """Verbosity levels for SQLMesh output."""
+
+    DEFAULT = 0
+    VERBOSE = 1
+    VERY_VERBOSE = 2
+
+    @property
+    def is_default(self) -> bool:
+        return self == Verbosity.DEFAULT
+
+    @property
+    def is_verbose(self) -> bool:
+        return self == Verbosity.VERBOSE
+
+    @property
+    def is_very_verbose(self) -> bool:
+        return self == Verbosity.VERY_VERBOSE
+
+
+class CompletionStatus(Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    NOTHING_TO_DO = "nothing_to_do"
+
+    @property
+    def is_success(self) -> bool:
+        return self == CompletionStatus.SUCCESS
+
+    @property
+    def is_failure(self) -> bool:
+        return self == CompletionStatus.FAILURE
+
+    @property
+    def is_nothing_to_do(self) -> bool:
+        return self == CompletionStatus.NOTHING_TO_DO

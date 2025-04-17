@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import sys
 import typing as t
-from difflib import ndiff
+from difflib import ndiff, unified_diff
 from functools import cached_property
 from sqlmesh.core import constants as c
 from sqlmesh.core.console import get_console
 from sqlmesh.core.macros import RuntimeStage
+from sqlmesh.core.model.common import sorted_python_env_payloads
 from sqlmesh.core.snapshot import Snapshot, SnapshotId, SnapshotTableInfo
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.pydantic import PydanticModel
@@ -53,6 +54,10 @@ class ContextDiff(PydanticModel):
     """Whether the currently stored environment record is in unfinalized state."""
     normalize_environment_name: bool
     """Whether the environment name should be normalized."""
+    previous_gateway_managed_virtual_layer: bool
+    """Whether the previous environment's virtual layer's views were created by the model specified gateways."""
+    gateway_managed_virtual_layer: bool
+    """Whether the virtual layer's views will be created by the model specified gateways."""
     create_from: str
     """The name of the environment the target environment will be created from if new."""
     create_from_env_exists: bool
@@ -96,6 +101,7 @@ class ContextDiff(PydanticModel):
         excluded_requirements: t.Optional[t.Set[str]] = None,
         diff_rendered: bool = False,
         environment_statements: t.Optional[t.List[EnvironmentStatements]] = [],
+        gateway_managed_virtual_layer: bool = False,
     ) -> ContextDiff:
         """Create a ContextDiff object.
 
@@ -226,6 +232,8 @@ class ContextDiff(PydanticModel):
             diff_rendered=diff_rendered,
             previous_environment_statements=previous_environment_statements,
             environment_statements=environment_statements,
+            previous_gateway_managed_virtual_layer=env.gateway_managed if env else False,
+            gateway_managed_virtual_layer=gateway_managed_virtual_layer,
         )
 
     @classmethod
@@ -263,6 +271,8 @@ class ContextDiff(PydanticModel):
             previous_requirements=env.requirements,
             requirements=env.requirements,
             previous_environment_statements=[],
+            previous_gateway_managed_virtual_layer=env.gateway_managed,
+            gateway_managed_virtual_layer=env.gateway_managed,
         )
 
     @property
@@ -273,6 +283,7 @@ class ContextDiff(PydanticModel):
             or self.is_unfinalized_environment
             or self.has_requirement_changes
             or self.has_environment_statements_changes
+            or self.previous_gateway_managed_virtual_layer != self.gateway_managed_virtual_layer
         )
 
     @property
@@ -330,22 +341,49 @@ class ContextDiff(PydanticModel):
             )
         )
 
-    def environment_statements_diff(self) -> str:
+    def environment_statements_diff(
+        self, include_python_env: bool = False
+    ) -> t.List[t.Tuple[str, str]]:
         def extract_statements(statements: t.List[EnvironmentStatements], attr: str) -> t.List[str]:
-            return [str(stmt) for statement in statements for stmt in getattr(statement, attr)]
+            return [
+                string
+                for statement in statements
+                for expr in (
+                    sorted_python_env_payloads(statement.python_env)
+                    if attr == "python_env"
+                    else getattr(statement, attr)
+                )
+                for string in expr.split("\n")
+            ]
 
-        def format_diff(runtime_stage: str) -> str:
-            previous = extract_statements(self.previous_environment_statements, runtime_stage)
-            current = extract_statements(self.environment_statements, runtime_stage)
-            return (
-                f"  {runtime_stage}:\n    " + "\n    ".join(ndiff(previous, current)) + "\n"
-                if previous or current
-                else ""
-            )
+        def compute_diff(attribute: str) -> t.Optional[t.Tuple[str, str]]:
+            previous = extract_statements(self.previous_environment_statements, attribute)
+            current = extract_statements(self.environment_statements, attribute)
 
-        return format_diff(RuntimeStage.BEFORE_ALL.value) + format_diff(
-            RuntimeStage.AFTER_ALL.value
-        )
+            if previous == current:
+                return None
+
+            diff_text = attribute if not attribute == "python_env" else "dependencies"
+            diff_text += ":\n"
+            if attribute == "python_env":
+                diff = list(unified_diff(previous, current))
+                diff_text += "\n".join(diff[2:] if len(diff) > 1 else diff)
+                return "python", diff_text + "\n"
+
+            diff_lines = list(ndiff(previous, current))
+            if any(line.startswith(("-", "+")) for line in diff_lines):
+                diff_text += "  " + "\n  ".join(diff_lines) + "\n"
+            return "sql", diff_text
+
+        return [
+            diff
+            for attribute in [
+                RuntimeStage.BEFORE_ALL.value,
+                RuntimeStage.AFTER_ALL.value,
+                *(["python_env"] if include_python_env else []),
+            ]
+            if (diff := compute_diff(attribute)) is not None
+        ]
 
     @property
     def environment_snapshots(self) -> t.List[SnapshotTableInfo]:

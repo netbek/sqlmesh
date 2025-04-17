@@ -8,7 +8,7 @@ import pathlib
 import re
 import typing as t
 from enum import Enum
-from functools import partial, lru_cache
+from functools import partial
 
 import pydantic
 from pydantic import Field
@@ -41,7 +41,7 @@ FORBIDDEN_STATE_SYNC_ENGINES = {
     # Nullable types are problematic
     "clickhouse",
 }
-MOTHERDUCK_TOKEN_REGEX = re.compile(r"(\?motherduck_token=)(\S*)")
+MOTHERDUCK_TOKEN_REGEX = re.compile(r"(\?|\&)(motherduck_token=)(\S*)")
 
 
 class ConnectionConfig(abc.ABC, BaseConfig):
@@ -50,6 +50,9 @@ class ConnectionConfig(abc.ABC, BaseConfig):
     register_comments: bool
     pre_ping: bool
     pretty_sql: bool = False
+
+    # Whether to share a  single connection across threads or create a new connection per thread.
+    shared_connection: t.ClassVar[bool] = False
 
     @property
     @abc.abstractmethod
@@ -116,6 +119,7 @@ class ConnectionConfig(abc.ABC, BaseConfig):
             register_comments=register_comments_override or self.register_comments,
             pre_ping=self.pre_ping,
             pretty_sql=self.pretty_sql,
+            shared_connection=self.shared_connection,
             **self._extra_engine_config,
         )
 
@@ -128,6 +132,34 @@ class ConnectionConfig(abc.ABC, BaseConfig):
         if hasattr(self, "db"):
             return self.db
         return None
+
+
+class DuckDBAttachOptions(BaseConfig):
+    type: str
+    path: str
+    read_only: bool = False
+
+    def to_sql(self, alias: str) -> str:
+        options = []
+        # 'duckdb' is actually not a supported type, but we'd like to allow it for
+        # fully qualified attach options or integration testing, similar to duckdb-dbt
+        if self.type not in ("duckdb", "motherduck"):
+            options.append(f"TYPE {self.type.upper()}")
+        if self.read_only:
+            options.append("READ_ONLY")
+        options_sql = f" ({', '.join(options)})" if options else ""
+        alias_sql = ""
+        # TODO: Add support for Postgres schema. Currently adding it blocks access to the information_schema
+        if self.type == "motherduck":
+            # MotherDuck does not support aliasing
+            md_db = self.path.replace("md:", "")
+            if md_db != alias.replace('"', ""):
+                raise ConfigError(
+                    f"MotherDuck does not support assigning an alias different from the database name {md_db}."
+                )
+        else:
+            alias_sql += f" AS {alias}"
+        return f"ATTACH '{self.path}'{alias_sql}{options_sql}"
 
 
 class BaseDuckDBConnectionConfig(ConnectionConfig):
@@ -155,6 +187,8 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
 
     token: t.Optional[str] = None
 
+    shared_connection: t.ClassVar[bool] = True
+
     _data_file_to_adapter: t.ClassVar[t.Dict[str, EngineAdapter]] = {}
 
     @model_validator(mode="before")
@@ -162,7 +196,8 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
         if not isinstance(data, dict):
             return data
 
-        if db_path := data.get("database") and data.get("catalogs"):
+        db_path = data.get("database")
+        if db_path and data.get("catalogs"):
             raise ConfigError(
                 "Cannot specify both `database` and `catalogs`. Define all your catalogs in `catalogs` and have the first entry be the default catalog"
             )
@@ -184,43 +219,6 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
     @property
     def _connection_factory(self) -> t.Callable:
         import duckdb
-
-        if self.concurrent_tasks > 1:
-            # ensures a single connection instance is used across threads rather than a new connection being established per thread
-            # this is in line with https://duckdb.org/docs/guides/python/multiple_threads.html
-            # the important thing is that the *cursor*'s are per thread, but the connection should be shared
-            @lru_cache
-            def _factory(*args: t.Any, **kwargs: t.Any) -> t.Any:
-                class ConnWrapper:
-                    def __init__(self, conn: duckdb.DuckDBPyConnection):
-                        self.conn = conn
-
-                    def __getattr__(self, attr: str) -> t.Any:
-                        return getattr(self.conn, attr)
-
-                    def close(self) -> None:
-                        # This overrides conn.close() to be a no-op to work with ThreadLocalConnectionPool which assumes that a new connection should
-                        # be created per thread. However, DuckDB expects the same connection instance to be shared across threads. There is a pattern
-                        # in the SQLMesh codebase that `EngineAdapter.recycle()` is called after doing things like merging intervals. This in turn causes
-                        # `ThreadLocalConnectionPool.close_all(exclude_calling_thread=True)` to be called.
-                        #
-                        # The problem with sharing a connection across threads and then allowing it to be closed for every thread except the current one
-                        # is that it gets closed for the current one too because its shared. This causes any ":memory:" databases to be discarded.
-                        # ":memory:" databases are convienient and are used heavily in our test suite amongst other things.
-                        #
-                        # Ok, so why not have a connection per thread as is the default for ThreadLocalConnectionPool? Two reasons:
-                        # - It makes any ":memory:" databases unique to that thread. So if one thread creates tables, another thread cant see them
-                        # - If you use local files instead (eg point each connection to the same db file) then all the connection instances
-                        #   fight over locks to the same file and performance tanks heavily
-                        #
-                        # From what I can tell, DuckDB expects the single process reading / writing the database from multiple
-                        # threads to /share the same connection/ and just use thread-local cursors. In order to support ":memory:" databases
-                        # and remove lock contention, the connection needs to live for the life of the application and not be closed
-                        pass
-
-                return ConnWrapper(duckdb.connect(*args, **kwargs))
-
-            return _factory
 
         return duckdb.connect
 
@@ -269,16 +267,20 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
                         query = f"ATTACH '{path_options}'"
                         if not path_options.startswith("md:"):
                             query += f" AS {alias}"
-                        elif self.token:
-                            query += f"?motherduck_token={self.token}"
                     cursor.execute(query)
                 except BinderException as e:
                     # If a user tries to create a catalog pointing at `:memory:` and with the name `memory`
                     # then we don't want to raise since this happens by default. They are just doing this to
                     # set it as the default catalog.
-                    if not (
-                        'database with name "memory" already exists' in str(e)
-                        and path_options == ":memory:"
+                    # If a user tried to attach a MotherDuck database/share which has already by attached via
+                    # `ATTACH 'md:'`, then we don't want to raise since this is expected.
+                    if (
+                        not (
+                            'database with name "memory" already exists' in str(e)
+                            and path_options == ":memory:"
+                        )
+                        and f"""database with name "{path_options.path.replace("md:", "")}" already exists"""
+                        not in str(e)
                     ):
                         raise e
                 if i == 0 and not getattr(self, "database", None):
@@ -302,7 +304,8 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
         data_files.discard(":memory:")
         for data_file in data_files:
             key = data_file if isinstance(data_file, str) else data_file.path
-            if adapter := BaseDuckDBConnectionConfig._data_file_to_adapter.get(key):
+            adapter = BaseDuckDBConnectionConfig._data_file_to_adapter.get(key)
+            if adapter is not None:
                 logger.info(
                     f"Using existing DuckDB adapter due to overlapping data file: {self._mask_motherduck_token(key)}"
                 )
@@ -331,7 +334,9 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
         return None
 
     def _mask_motherduck_token(self, string: str) -> str:
-        return MOTHERDUCK_TOKEN_REGEX.sub(lambda m: f"{m.group(1)}{'*' * len(m.group(2))}", string)
+        return MOTHERDUCK_TOKEN_REGEX.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}{'*' * len(m.group(3))}", string
+        )
 
 
 class MotherDuckConnectionConfig(BaseDuckDBConnectionConfig):
@@ -349,36 +354,13 @@ class MotherDuckConnectionConfig(BaseDuckDBConnectionConfig):
         from sqlmesh import __version__
 
         custom_user_agent_config = {"custom_user_agent": f"SQLMesh/{__version__}"}
-        if not self.database:
-            return {"config": custom_user_agent_config}
-        connection_str = f"md:{self.database or ''}"
+        connection_str = "md:"
+        if self.database:
+            # Attach single MD database instead of all databases on the account
+            connection_str += f"{self.database}?attach_mode=single"
         if self.token:
-            connection_str += f"?motherduck_token={self.token}"
+            connection_str += f"{'&' if self.database else '?'}motherduck_token={self.token}"
         return {"database": connection_str, "config": custom_user_agent_config}
-
-
-class DuckDBAttachOptions(BaseConfig):
-    type: str
-    path: str
-    read_only: bool = False
-    token: t.Optional[str] = None
-
-    def to_sql(self, alias: str) -> str:
-        options = []
-        # 'duckdb' is actually not a supported type, but we'd like to allow it for
-        # fully qualified attach options or integration testing, similar to duckdb-dbt
-        if self.type not in ("duckdb", "motherduck"):
-            options.append(f"TYPE {self.type.upper()}")
-        if self.read_only:
-            options.append("READ_ONLY")
-        # TODO: Add support for Postgres schema. Currently adding it blocks access to the information_schema
-        alias_sql = (
-            # MotherDuck does not support aliasing
-            f" AS {alias}" if not (self.type == "motherduck" or self.path.startswith("md:")) else ""
-        )
-        options_sql = f" ({', '.join(options)})" if options else ""
-        token_sql = "?motherduck_token=" + self.token if self.token else ""
-        return f"ATTACH '{self.path}{token_sql}'{alias_sql}{options_sql}"
 
 
 class DuckDBConnectionConfig(BaseDuckDBConnectionConfig):
@@ -407,6 +389,8 @@ class SnowflakeConnectionConfig(ConnectionConfig):
         register_comments: Whether or not to register model comments with the SQL engine.
         pre_ping: Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive.
         session_parameters: The optional session parameters to set for the connection.
+        host: Host address for the connection.
+        port: Port for the connection.
     """
 
     account: str
@@ -417,6 +401,8 @@ class SnowflakeConnectionConfig(ConnectionConfig):
     role: t.Optional[str] = None
     authenticator: t.Optional[str] = None
     token: t.Optional[str] = None
+    host: t.Optional[str] = None
+    port: t.Optional[int] = None
     application: t.Literal["Tobiko_SQLMesh"] = "Tobiko_SQLMesh"
 
     # Private Key Auth
@@ -550,6 +536,8 @@ class SnowflakeConnectionConfig(ConnectionConfig):
             "private_key",
             "session_parameters",
             "application",
+            "host",
+            "port",
         }
 
     @property
@@ -861,8 +849,9 @@ class BigQueryConnectionConfig(ConnectionConfig):
     client_secret: t.Optional[str] = None
     token_uri: t.Optional[str] = None
     scopes: t.Tuple[str, ...] = ("https://www.googleapis.com/auth/bigquery",)
-    job_creation_timeout_seconds: t.Optional[int] = None
+    impersonated_service_account: t.Optional[str] = None
     # Extra Engine Config
+    job_creation_timeout_seconds: t.Optional[int] = None
     job_execution_timeout_seconds: t.Optional[int] = None
     job_retries: t.Optional[int] = 1
     job_retry_deadline_seconds: t.Optional[int] = None
@@ -911,6 +900,7 @@ class BigQueryConnectionConfig(ConnectionConfig):
     def _static_connection_kwargs(self) -> t.Dict[str, t.Any]:
         """The static connection kwargs for this connection"""
         import google.auth
+        from google.auth import impersonated_credentials
         from google.api_core import client_info, client_options
         from google.oauth2 import credentials, service_account
 
@@ -935,6 +925,13 @@ class BigQueryConnectionConfig(ConnectionConfig):
             )
         else:
             raise ConfigError("Invalid BigQuery Connection Method")
+
+        if self.impersonated_service_account:
+            creds = impersonated_credentials.Credentials(
+                source_credentials=creds,
+                target_principal=self.impersonated_service_account,
+                target_scopes=self.scopes,
+            )
 
         options = client_options.ClientOptions(quota_project_id=self.quota_project)
         project = self.execution_project or self.project or None
@@ -1187,6 +1184,7 @@ class PostgresConnectionConfig(ConnectionConfig):
     connect_timeout: int = 10
     role: t.Optional[str] = None
     sslmode: t.Optional[str] = None
+    application_name: t.Optional[str] = None
 
     concurrent_tasks: int = 4
     register_comments: bool = True
@@ -1205,6 +1203,7 @@ class PostgresConnectionConfig(ConnectionConfig):
             "keepalives_idle",
             "connect_timeout",
             "sslmode",
+            "application_name",
         }
 
     @property

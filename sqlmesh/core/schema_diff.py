@@ -90,15 +90,13 @@ class TableAlterColumn(PydanticModel):
 
         if kwarg_type.is_type(exp.DataType.Type.STRUCT):
             return cls.struct(name, quoted=quoted)
-        elif kwarg_type.is_type(exp.DataType.Type.ARRAY):
+        if kwarg_type.is_type(exp.DataType.Type.ARRAY):
             if kwarg_type.expressions and kwarg_type.expressions[0].is_type(
                 exp.DataType.Type.STRUCT
             ):
                 return cls.array_of_struct(name, quoted=quoted)
-            else:
-                return cls.array_of_primitive(name, quoted=quoted)
-        else:
-            return cls.primitive(name, quoted=quoted)
+            return cls.array_of_primitive(name, quoted=quoted)
+        return cls.primitive(name, quoted=quoted)
 
     @property
     def is_array(self) -> bool:
@@ -268,22 +266,21 @@ class TableAlterOperation(PydanticModel):
                     )
                 ],
             )
-        elif self.is_add:
+        if self.is_add:
             alter_table = exp.Alter(this=exp.to_table(table_name), kind="TABLE")
             column = self.column_def(array_element_selector)
             alter_table.set("actions", [column])
             if self.add_position:
                 column.set("position", self.add_position.column_position_node)
             return alter_table
-        elif self.is_drop:
+        if self.is_drop:
             alter_table = exp.Alter(this=exp.to_table(table_name), kind="TABLE")
             drop_column = exp.Drop(
                 this=self.column(array_element_selector), kind="COLUMN", cascade=self.cascade
             )
             alter_table.set("actions", [drop_column])
             return alter_table
-        else:
-            raise ValueError(f"Unknown operation {self.op}")
+        raise ValueError(f"Unknown operation {self.op}")
 
 
 class SchemaDiffer(PydanticModel):
@@ -341,6 +338,7 @@ class SchemaDiffer(PydanticModel):
     coerceable_types_: t.Dict[exp.DataType, t.Set[exp.DataType]] = Field(
         default_factory=dict, alias="coerceable_types"
     )
+    precision_increase_allowed_types: t.Optional[t.Set[exp.DataType.Type]] = None
     support_coercing_compatible_types: bool = False
     drop_cascade: bool = False
     parameterized_type_defaults: t.Dict[
@@ -367,7 +365,10 @@ class SchemaDiffer(PydanticModel):
     def _is_compatible_type(self, current_type: exp.DataType, new_type: exp.DataType) -> bool:
         # types are identical or both types are parameterized and new has higher precision
         # - default parameter values are automatically provided if not present
-        if current_type == new_type or self._is_precision_increase(current_type, new_type):
+        if current_type == new_type or (
+            self._is_precision_increase_allowed(current_type)
+            and self._is_precision_increase(current_type, new_type)
+        ):
             return True
         # types are un-parameterized and compatible
         if current_type in self.compatible_types:
@@ -389,6 +390,12 @@ class SchemaDiffer(PydanticModel):
 
             return is_coerceable
         return False
+
+    def _is_precision_increase_allowed(self, current_type: exp.DataType) -> bool:
+        return (
+            self.precision_increase_allowed_types is None
+            or current_type.this in self.precision_increase_allowed_types
+        )
 
     def _is_precision_increase(self, current_type: exp.DataType, new_type: exp.DataType) -> bool:
         if current_type.this == new_type.this and not current_type.is_type(
@@ -583,7 +590,7 @@ class SchemaDiffer(PydanticModel):
                         )
         if self._is_coerceable_type(current_type, new_type):
             return []
-        elif self._is_compatible_type(current_type, new_type):
+        if self._is_compatible_type(current_type, new_type):
             struct.expressions.pop(pos)
             struct.expressions.insert(pos, new_kwarg)
             col_pos = (
@@ -600,10 +607,9 @@ class SchemaDiffer(PydanticModel):
                     col_pos,
                 )
             ]
-        else:
-            return self._drop_operation(
-                columns, root_struct, pos, root_struct
-            ) + self._add_operation(columns, pos, new_kwarg, struct, root_struct)
+        return self._drop_operation(columns, root_struct, pos, root_struct) + self._add_operation(
+            columns, pos, new_kwarg, struct, root_struct
+        )
 
     def _resolve_alter_operations(
         self,

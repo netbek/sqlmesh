@@ -231,8 +231,11 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, Row
     ) -> t.Dict[str, exp.DataType]:
         """Fetches column names and types for the target table."""
 
-        def dtype_to_sql(dtype: t.Optional[StandardSqlDataType]) -> str:
+        def dtype_to_sql(
+            dtype: t.Optional[StandardSqlDataType], field: bigquery.SchemaField
+        ) -> str:
             assert dtype
+            assert field
 
             kind = dtype.type_kind
             assert kind
@@ -240,16 +243,25 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, Row
             # Not using the enum value to preserve compatibility with older versions
             # of the BigQuery library.
             if kind.name == "ARRAY":
-                return f"ARRAY<{dtype_to_sql(dtype.array_element_type)}>"
+                return f"ARRAY<{dtype_to_sql(dtype.array_element_type, field)}>"
             if kind.name == "STRUCT":
                 struct_type = dtype.struct_type
                 assert struct_type
                 fields = ", ".join(
-                    f"{field.name} {dtype_to_sql(field.type)}" for field in struct_type.fields
+                    f"{struct_field.name} {dtype_to_sql(struct_field.type, nested_field)}"
+                    for struct_field, nested_field in zip(struct_type.fields, field.fields)
                 )
                 return f"STRUCT<{fields}>"
             if kind.name == "TYPE_KIND_UNSPECIFIED":
-                return "JSON"
+                field_type = field.field_type
+
+                if field_type == "RANGE":
+                    # If the field is a RANGE then `range_element_type` should be set to
+                    # one of `"DATE"`, `"DATETIME"` or `"TIMESTAMP"`.
+                    return f"RANGE<{field.range_element_type.element_type}>"
+
+                return field_type
+
             return kind.name
 
         def create_mapping_schema(
@@ -257,7 +269,7 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, Row
         ) -> t.Dict[str, exp.DataType]:
             return {
                 field.name: exp.DataType.build(
-                    dtype_to_sql(field.to_standard_sql().type), dialect=self.dialect
+                    dtype_to_sql(field.to_standard_sql().type, field), dialect=self.dialect
                 )
                 for field in schema
             }
@@ -265,7 +277,7 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, Row
         table = exp.to_table(table_name)
         if len(table.parts) == 3 and "." in table.name:
             # The client's `get_table` method can't handle paths with >3 identifiers
-            self.execute(exp.select("*").from_(table).limit(1))
+            self.execute(exp.select("*").from_(table).limit(0))
             query_results = self._query_job._query_results
             columns = create_mapping_schema(query_results.schema)
         else:
@@ -590,9 +602,12 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, Row
             raise SQLMeshError(
                 f"The partition expression '{partition_sql}' doesn't contain a column."
             )
-        with self.session({}), self.temp_table(
-            query_or_df, name=table_name, partitioned_by=partitioned_by
-        ) as temp_table_name:
+        with (
+            self.session({}),
+            self.temp_table(
+                query_or_df, name=table_name, partitioned_by=partitioned_by
+            ) as temp_table_name,
+        ):
             if columns_to_types is None or columns_to_types[
                 partition_column.name
             ] == exp.DataType.build("unknown"):
@@ -818,7 +833,8 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, Row
             return exp.DataType(this=col_type.this, expressions=column_expressions, nested=True)
 
         # Recursively build column definitions for BigQuery's RECORDs (struct) and REPEATED RECORDs (array of struct)
-        if isinstance(col_type, exp.DataType) and (expressions := col_type.expressions):
+        if isinstance(col_type, exp.DataType) and col_type.expressions:
+            expressions = col_type.expressions
             if col_type.is_type(exp.DataType.Type.STRUCT):
                 col_type = _build_struct_with_descriptions(col_type, nested_names + [col_name])
             elif col_type.is_type(exp.DataType.Type.ARRAY) and expressions[0].is_type(
@@ -1145,7 +1161,7 @@ class _ErrorCounter:
 
         if isinstance(error, self.retryable_errors):
             return True
-        elif isinstance(error, Forbidden) and any(
+        if isinstance(error, Forbidden) and any(
             e["reason"] == "rateLimitExceeded" for e in error.errors
         ):
             return True

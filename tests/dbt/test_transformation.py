@@ -286,6 +286,12 @@ def test_model_kind():
         context
     ) == IncrementalUnmanagedKind(insert_overwrite=True, disable_restatement=False)
 
+    assert ModelConfig(materialized=Materialization.INCREMENTAL, forward_only=False).model_kind(
+        context
+    ) == IncrementalUnmanagedKind(
+        insert_overwrite=True, disable_restatement=False, forward_only=False
+    )
+
     assert ModelConfig(
         materialized=Materialization.INCREMENTAL, incremental_strategy="append"
     ).model_kind(context) == IncrementalUnmanagedKind(disable_restatement=False)
@@ -875,9 +881,7 @@ def test_modules(sushi_test_project: Project):
     assert context.render("{{ modules.re.search('(?<=abc)def', 'abcdef').group(0) }}") == "def"
 
     # itertools
-    itertools_jinja = (
-        "{% for num in modules.itertools.accumulate([5]) %}" "{{ num }}" "{% endfor %}"
-    )
+    itertools_jinja = "{% for num in modules.itertools.accumulate([5]) %}{{ num }}{% endfor %}"
     assert context.render(itertools_jinja) == "5"
 
 
@@ -914,7 +918,7 @@ def test_column(sushi_test_project: Project):
     assert context.render("{{ api.Column }}") == "<class 'dbt.adapters.base.column.Column'>"
 
     jinja = (
-        "{% set col = api.Column('foo', 'integer') %}" "{{ col.is_integer() }} {{ col.is_string()}}"
+        "{% set col = api.Column('foo', 'integer') %}{{ col.is_integer() }} {{ col.is_string()}}"
     )
 
     assert context.render(jinja) == "True False"
@@ -995,6 +999,16 @@ def test_dbt_version(sushi_test_project: Project):
     context = sushi_test_project.context
 
     assert context.render("{{ dbt_version }}").startswith("1.")
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_dbt_on_run_start_end(sushi_test_project: Project):
+    context = sushi_test_project.context
+    assert context._manifest
+    assert context._manifest._on_run_start == [
+        "CREATE TABLE IF NOT EXISTS analytic_stats (physical_table VARCHAR, evaluation_time VARCHAR);"
+    ]
+    assert context._manifest._on_run_end == ["{{ create_tables(schemas) }}"]
 
 
 @pytest.mark.xdist_group("dbt_manifest")
@@ -1451,7 +1465,7 @@ def test_refs_in_jinja_globals(sushi_test_project: Project, mocker: MockerFixtur
     }
 
 
-def test_dbt_incremental_allow_partials_by_default():
+def test_allow_partials_by_default():
     context = DbtContext()
     context._target = SnowflakeConfig(
         name="target",
@@ -1471,7 +1485,7 @@ def test_dbt_incremental_allow_partials_by_default():
         materialized=Materialization.TABLE.value,
     )
     assert model.allow_partials is None
-    assert not model.to_sqlmesh(context).allow_partials
+    assert model.to_sqlmesh(context).allow_partials
 
     model.materialized = Materialization.INCREMENTAL.value
     assert model.allow_partials is None

@@ -238,8 +238,10 @@ class ModelConfig(BaseModelConfig):
             incremental_kind_kwargs["on_destructive_change"] = on_destructive_change
 
         for field in ("forward_only", "auto_restatement_cron"):
-            field_val = getattr(self, field, None) or self.meta.get(field, None)
-            if field_val:
+            field_val = getattr(self, field, None)
+            if field_val is None:
+                field_val = self.meta.get(field, None)
+            if field_val is not None:
                 incremental_kind_kwargs[field] = field_val
 
         if materialization == Materialization.TABLE:
@@ -249,8 +251,10 @@ class ModelConfig(BaseModelConfig):
         if materialization == Materialization.INCREMENTAL:
             incremental_by_kind_kwargs: t.Dict[str, t.Any] = {"dialect": self.dialect(context)}
             for field in ("batch_size", "batch_concurrency", "lookback"):
-                field_val = getattr(self, field, None) or self.meta.get(field, None)
-                if field_val:
+                field_val = getattr(self, field, None)
+                if field_val is None:
+                    field_val = self.meta.get(field, None)
+                if field_val is not None:
                     incremental_by_kind_kwargs[field] = field_val
 
             if self.time_column:
@@ -556,10 +560,12 @@ class ModelConfig(BaseModelConfig):
 
         kind = self.model_kind(context)
         allow_partials = model_kwargs.pop("allow_partials", None)
-        if allow_partials is None and (
-            kind.is_incremental_unmanaged or kind.is_incremental_by_unique_key
+        if (
+            allow_partials is None
+            and kind.is_materialized
+            and not kind.is_incremental_by_time_range
         ):
-            # Set allow_partials to True for dbt incremental models to preserve the original semantics.
+            # Set allow_partials to True for dbt models to preserve the original semantics.
             allow_partials = True
 
         model = create_sql_model(

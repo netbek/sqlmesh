@@ -4,14 +4,13 @@ import asyncio
 import json
 import typing as t
 import unittest
-
 from fastapi.encoders import jsonable_encoder
 from sse_starlette.sse import ServerSentEvent
-
+from sqlmesh.core.snapshot.definition import Interval, Intervals
 from sqlmesh.core.console import TerminalConsole
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.plan.definition import EvaluatablePlan
-from sqlmesh.core.snapshot import Snapshot, SnapshotInfoLike
+from sqlmesh.core.snapshot import Snapshot, SnapshotInfoLike, SnapshotTableInfo
 from sqlmesh.core.test import ModelTest
 from sqlmesh.utils.date import now_timestamp
 from web.server import models
@@ -41,14 +40,14 @@ class ApiConsole(TerminalConsole):
 
     def start_creation_progress(
         self,
-        total_tasks: int,
+        snapshots: t.List[Snapshot],
         environment_naming_info: EnvironmentNamingInfo,
         default_catalog: t.Optional[str],
     ) -> None:
         if self.plan_apply_stage_tracker:
             self.plan_apply_stage_tracker.add_stage(
                 models.PlanStage.creation,
-                models.PlanStageCreation(total_tasks=total_tasks, num_tasks=0),
+                models.PlanStageCreation(total_tasks=len(snapshots), num_tasks=0),
             )
 
         self.log_event_plan_apply()
@@ -91,11 +90,14 @@ class ApiConsole(TerminalConsole):
 
     def start_evaluation_progress(
         self,
-        batches: t.Dict[Snapshot, int],
+        batched_intervals: t.Dict[Snapshot, Intervals],
         environment_naming_info: EnvironmentNamingInfo,
         default_catalog: t.Optional[str],
     ) -> None:
         if self.plan_apply_stage_tracker:
+            batch_sizes = {
+                snapshot: len(intervals) for snapshot, intervals in batched_intervals.items()
+            }
             tasks = {
                 snapshot.name: models.BackfillTask(
                     completed=0,
@@ -104,7 +106,7 @@ class ApiConsole(TerminalConsole):
                     name=snapshot.name,
                     view_name=snapshot.display_name(environment_naming_info, default_catalog),
                 )
-                for snapshot, total_tasks in batches.items()
+                for snapshot, total_tasks in batch_sizes.items()
             }
             self.plan_apply_stage_tracker.add_stage(
                 models.PlanStage.backfill,
@@ -123,7 +125,13 @@ class ApiConsole(TerminalConsole):
         self.log_event_plan_apply()
 
     def update_snapshot_evaluation_progress(
-        self, snapshot: Snapshot, batch_idx: int, duration_ms: t.Optional[int]
+        self,
+        snapshot: Snapshot,
+        interval: Interval,
+        batch_idx: int,
+        duration_ms: t.Optional[int],
+        num_audits_passed: int,
+        num_audits_failed: int,
     ) -> None:
         if self.plan_apply_stage_tracker and self.plan_apply_stage_tracker.backfill:
             task = self.plan_apply_stage_tracker.backfill.tasks[snapshot.name]
@@ -148,7 +156,7 @@ class ApiConsole(TerminalConsole):
 
     def start_promotion_progress(
         self,
-        total_tasks: int,
+        snapshots: t.List[SnapshotTableInfo],
         environment_naming_info: EnvironmentNamingInfo,
         default_catalog: t.Optional[str],
     ) -> None:
@@ -156,7 +164,7 @@ class ApiConsole(TerminalConsole):
             self.plan_apply_stage_tracker.add_stage(
                 models.PlanStage.promote,
                 models.PlanStagePromote(
-                    total_tasks=total_tasks,
+                    total_tasks=len(snapshots),
                     num_tasks=0,
                     target_environment=environment_naming_info.name,
                 ),

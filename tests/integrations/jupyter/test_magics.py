@@ -238,7 +238,7 @@ def test_diff(sushi_context, notebook, convert_all_html_output_to_text, get_all_
     assert len(output.outputs) == 2
     assert convert_all_html_output_to_text(output) == [
         "Differences from the `prod` environment:",
-        "Models:\n├── Directly Modified:\n│   └── sqlmesh_example.test\n└── Metadata Updated:\n    └── sqlmesh_example.test",
+        "Models:\n└── Directly Modified:\n    └── sqlmesh_example.test",
     ]
     assert get_all_html_output(output) == [
         str(
@@ -266,21 +266,12 @@ def test_diff(sushi_context, notebook, convert_all_html_output_to_text, get_all_
                         autoescape=False,
                     )
                 )
-                + "├── "
+                + "└── "
                 + str(
                     h(
                         "span",
                         {"style": "font-weight: bold"},
                         "Directly Modified:",
-                        autoescape=False,
-                    )
-                )
-                + "│   └── sqlmesh_example.test└── "
-                + str(
-                    h(
-                        "span",
-                        {"style": "font-weight: bold"},
-                        "Metadata Updated:",
                         autoescape=False,
                     )
                 )
@@ -300,7 +291,7 @@ def test_plan(
 
     # TODO: Should this be going to stdout? This is printing the status updates for when each batch finishes for
     # the models and how long it took
-    assert len(output.stdout.strip().split("\n")) == 24
+    assert len(output.stdout.strip().split("\n")) == 46
     assert not output.stderr
     assert len(output.outputs) == 4
     text_output = convert_all_html_output_to_text(output)
@@ -308,14 +299,14 @@ def test_plan(
     # This has minor differences between CI/CD and local.
     assert "[2K" in text_output[0]
     assert text_output[1].startswith(
-        "Virtually Updating 'prod' ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100.0%"
+        "Updating virtual layer  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100.0%"
     )
     # TODO: Is this what we expect?
     assert text_output[2] == ""
-    assert text_output[3] == "Target environment updated successfully"
+    assert text_output[3] == "✔ Virtual layer updated"
     assert convert_all_html_output_to_tags(output) == [
         ["pre", "span"],
-        ["pre"] + ["span"] * 4,
+        ["pre"] + ["span"] * 5,
         ["pre"],
         ["pre", "span"],
     ]
@@ -335,7 +326,7 @@ def test_run_dag(
     assert not output.stderr
     assert len(output.outputs) == 2
     assert convert_all_html_output_to_text(output) == [
-        "Model batches executed successfully",
+        "✔ Model batches executed",
         "Run finished for environment 'prod'",
     ]
     assert get_all_html_output(output) == [
@@ -346,7 +337,7 @@ def test_run_dag(
                 h(
                     "span",
                     {"style": SUCCESS_STYLE},
-                    "Model batches executed successfully",
+                    "✔ Model batches executed",
                     autoescape=False,
                 ),
                 autoescape=False,
@@ -650,8 +641,19 @@ def test_table_diff(notebook, loaded_sushi_context, convert_all_html_output_to_t
 
     assert not output.stdout
     assert not output.stderr
-    assert len(output.outputs) == 4
+    assert len(output.outputs) == 5
     assert convert_all_html_output_to_text(output) == [
+        """Table Diff
+├── Model:
+│   └── sushi.top_waiters
+├── Environment:
+│   ├── Source: dev
+│   └── Target: prod
+├── Tables:
+│   ├── Source: memory.sushi__dev.top_waiters
+│   └── Target: memory.sushi.top_waiters
+└── Join On:
+    └── waiter_id""",
         """Schema Diff Between 'DEV' and 'PROD' environments for model 'sushi.top_waiters':
 └── Schemas match""",
         """Row Counts:
@@ -674,3 +676,28 @@ def test_table_name(notebook, loaded_sushi_context, convert_all_html_output_to_t
     assert convert_all_html_output_to_text(output)[0].startswith(
         "memory.sqlmesh__sushi.sushi__orders__"
     )
+
+
+def test_lint(notebook, sushi_context):
+    from sqlmesh.core.config import LinterConfig
+
+    sushi_context.config.linter = LinterConfig(enabled=True, warn_rules="ALL")
+    sushi_context.load()
+
+    with capture_output() as output:
+        notebook.run_line_magic(magic_name="lint", line="")
+
+    assert len(output.outputs) > 1
+    assert "Linter warnings for" in output.outputs[0].data["text/plain"]
+
+    with capture_output() as output:
+        notebook.run_line_magic(magic_name="lint", line="--models sushi.items")
+
+    assert len(output.outputs) == 1
+    assert "Linter warnings for" in output.outputs[0].data["text/plain"]
+
+    with capture_output() as output:
+        notebook.run_line_magic(magic_name="lint", line="--models sushi.items sushi.raw_marketing")
+
+    assert len(output.outputs) == 2
+    assert "Linter warnings for" in output.outputs[0].data["text/plain"]

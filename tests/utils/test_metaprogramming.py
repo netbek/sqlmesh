@@ -11,7 +11,7 @@ import sqlglot
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp
 from sqlglot import exp as expressions
-from sqlglot.expressions import to_table
+from sqlglot.expressions import SQLGLOT_META, to_table
 from sqlglot.optimizer.pushdown_projections import SELECT_ALL
 
 import tests.utils.test_date as test_date
@@ -63,6 +63,7 @@ def test_print_exception(mocker: MockerFixture):
 X = 1
 Y = 2
 Z = 3
+W = 0
 
 my_lambda = lambda: print("z")  # noqa: E731
 
@@ -96,14 +97,7 @@ def other_func(a: int) -> int:
     pd.DataFrame([{"x": 1}])
     to_table("y")
     my_lambda()  # type: ignore
-    return X + a
-
-
-def noop_metadata() -> None:
-    return None
-
-
-setattr(noop_metadata, c.SQLMESH_METADATA, True)
+    return X + a + W
 
 
 @contextmanager
@@ -133,8 +127,7 @@ def main_func(y: int, foo=exp.true(), *, bar=expressions.Literal.number(1) + 2) 
     sqlglot.parse_one("1")
     MyClass()
     DataClass(x=y)
-    noop_metadata()
-    normalize_model_name("test")
+    normalize_model_name("test" + SQLGLOT_META)
     fetch_data()
     function_with_custom_decorator()
 
@@ -153,7 +146,6 @@ def test_func_globals() -> None:
         "Z": 3,
         "DataClass": DataClass,
         "MyClass": MyClass,
-        "noop_metadata": noop_metadata,
         "normalize_model_name": normalize_model_name,
         "other_func": other_func,
         "sqlglot": sqlglot,
@@ -162,9 +154,11 @@ def test_func_globals() -> None:
         "fetch_data": fetch_data,
         "test_context_manager": test_context_manager,
         "function_with_custom_decorator": function_with_custom_decorator,
+        "SQLGLOT_META": SQLGLOT_META,
     }
     assert func_globals(other_func) == {
         "X": 1,
+        "W": 0,
         "my_lambda": my_lambda,
         "pd": pd,
         "to_table": to_table,
@@ -192,8 +186,7 @@ def test_normalize_source() -> None:
     sqlglot.parse_one('1')
     MyClass()
     DataClass(x=y)
-    noop_metadata()
-    normalize_model_name('test')
+    normalize_model_name('test' + SQLGLOT_META)
     fetch_data()
     function_with_custom_decorator()
 
@@ -212,27 +205,28 @@ def test_normalize_source() -> None:
     pd.DataFrame([{'x': 1}])
     to_table('y')
     my_lambda()
-    return X + a"""
+    return X + a + W"""
     )
 
 
 def test_serialize_env_error() -> None:
     with pytest.raises(SQLMeshError):
         # pretend to be the module pandas
-        serialize_env({"test_date": test_date}, path=Path("tests/utils"))
+        serialize_env({"test_date": (test_date, None)}, path=Path("tests/utils"))
 
     with pytest.raises(SQLMeshError):
-        serialize_env({"select_all": SELECT_ALL}, path=Path("tests/utils"))
+        serialize_env({"select_all": (SELECT_ALL, None)}, path=Path("tests/utils"))
 
 
 def test_serialize_env() -> None:
-    env: t.Dict[str, t.Any] = {}
     path = Path("tests/utils")
-    build_env(main_func, env=env, name="MAIN", path=path)
-    env = serialize_env(env, path=path)  # type: ignore
+    env: t.Dict[str, t.Tuple[t.Any, t.Optional[bool]]] = {}
 
-    assert prepare_env(env)
-    assert env == {
+    build_env(main_func, env=env, name="MAIN", path=path)
+    serialized_env = serialize_env(env, path=path)  # type: ignore
+    assert prepare_env(serialized_env)
+
+    expected_env = {
         "MAIN": Executable(
             name="main_func",
             alias="MAIN",
@@ -242,8 +236,7 @@ def test_serialize_env() -> None:
     sqlglot.parse_one('1')
     MyClass()
     DataClass(x=y)
-    noop_metadata()
-    normalize_model_name('test')
+    normalize_model_name('test' + SQLGLOT_META)
     fetch_data()
     function_with_custom_decorator()
 
@@ -256,6 +249,7 @@ def test_serialize_env() -> None:
         "X": Executable(payload="1", kind=ExecutableKind.VALUE),
         "Y": Executable(payload="2", kind=ExecutableKind.VALUE),
         "Z": Executable(payload="3", kind=ExecutableKind.VALUE),
+        "W": Executable(payload="0", kind=ExecutableKind.VALUE),
         "_GeneratorContextManager": Executable(
             payload="from contextlib import _GeneratorContextManager", kind=ExecutableKind.IMPORT
         ),
@@ -316,13 +310,6 @@ def test_context_manager():
             path="test_metaprogramming.py",
             payload="my_lambda = lambda : print('z')",
         ),
-        "noop_metadata": Executable(
-            name="noop_metadata",
-            path="test_metaprogramming.py",
-            payload="""def noop_metadata():
-    return None""",
-            is_metadata=True,
-        ),
         "normalize_model_name": Executable(
             payload="from sqlmesh.core.dialect import normalize_model_name",
             kind=ExecutableKind.IMPORT,
@@ -336,7 +323,7 @@ def test_context_manager():
     pd.DataFrame([{'x': 1}])
     to_table('y')
     my_lambda()
-    return X + a""",
+    return X + a + W""",
         ),
         "test_context_manager": Executable(
             payload="""@contextmanager
@@ -398,4 +385,23 @@ def function_with_custom_decorator():
     return""",
             alias="_func",
         ),
+        "SQLGLOT_META": Executable.value("sqlglot.meta"),
     }
+
+    assert all(is_metadata is None for (_, is_metadata) in env.values())
+    assert serialized_env == expected_env
+
+    # Annotate the entrypoint as "metadata only" to show how it propagates
+    setattr(main_func, c.SQLMESH_METADATA, True)
+
+    env = {}
+
+    build_env(main_func, env=env, name="MAIN", path=path)
+    serialized_env = serialize_env(env, path=path)  # type: ignore
+    assert prepare_env(serialized_env)
+
+    expected_env = {k: Executable(**v.dict(), is_metadata=True) for k, v in expected_env.items()}
+
+    # Every object is treated as "metadata only", transitively
+    assert all(is_metadata for (_, is_metadata) in env.values())
+    assert serialized_env == expected_env

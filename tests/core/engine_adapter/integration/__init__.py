@@ -210,7 +210,7 @@ class TestContext:
                 batch_end=sys.maxsize,
                 columns_to_types=columns_to_types,
             )
-        elif self.test_type == "pyspark":
+        if self.test_type == "pyspark":
             return self.engine_adapter.spark.createDataFrame(data)  # type: ignore
         return self._format_df(data, to_datetime=self.dialect != "trino")
 
@@ -290,7 +290,7 @@ class TestContext:
                 WHERE
                     n.nspname = '{schema_name}'
                     AND pgc.relname = '{table_name}'
-                    AND pgc.relkind = '{'v' if table_kind == "VIEW" else 'r'}'
+                    AND pgc.relkind = '{"v" if table_kind == "VIEW" else "r"}'
                 ;
             """
         elif self.dialect in ["mysql", "snowflake"]:
@@ -362,7 +362,7 @@ class TestContext:
                 WHERE 
                     c.relname = '{table_name}'
                     AND n.nspname= '{schema_name}'
-                    AND c.relkind = '{'v' if table_kind == "VIEW" else 'r'}'
+                    AND c.relkind = '{"v" if table_kind == "VIEW" else "r"}'
                 ;
             """
 
@@ -405,7 +405,7 @@ class TestContext:
                 WHERE
                     n.nspname = '{schema_name}'
                     AND pgc.relname = '{table_name}'
-                    AND pgc.relkind = '{'v' if table_kind == "VIEW" else 'r'}'
+                    AND pgc.relkind = '{"v" if table_kind == "VIEW" else "r"}'
                 ;
             """
         elif self.dialect in ["mysql", "snowflake", "trino"]:
@@ -471,7 +471,7 @@ class TestContext:
                 WHERE
                     n.nspname = '{schema_name}'
                     AND c.relname = '{table_name}' 
-                    AND c.relkind = '{'v' if table_kind == "VIEW" else 'r'}'
+                    AND c.relkind = '{"v" if table_kind == "VIEW" else "r"}'
                 ;
             """
 
@@ -550,7 +550,7 @@ class TestContext:
     def drop_catalog(self, catalog_name: str):
         if self.dialect == "bigquery":
             return  # bigquery cannot create/drop catalogs
-        elif self.dialect == "databricks":
+        if self.dialect == "databricks":
             self.engine_adapter.execute(f"DROP CATALOG IF EXISTS {catalog_name} CASCADE")
         else:
             self.engine_adapter.execute(f'DROP DATABASE IF EXISTS "{catalog_name}"')

@@ -63,7 +63,7 @@ from sqlmesh.core.snapshot.definition import (
 )
 from sqlmesh.utils import AttributeDict
 from sqlmesh.utils.date import DatetimeRanges, to_date, to_datetime, to_timestamp
-from sqlmesh.utils.errors import SQLMeshError
+from sqlmesh.utils.errors import SQLMeshError, SignalEvalError
 from sqlmesh.utils.jinja import JinjaMacroRegistry, MacroInfo
 from sqlmesh.core.console import get_console
 
@@ -130,6 +130,7 @@ def test_json(snapshot: Snapshot):
                 "batch_size": 30,
                 "forward_only": False,
                 "on_destructive_change": "ERROR",
+                "partition_by_time_column": True,
                 "disable_restatement": False,
                 "dialect": "spark",
             },
@@ -859,7 +860,7 @@ def test_fingerprint(model: Model, parent_model: Model):
 
     original_fingerprint = SnapshotFingerprint(
         data_hash="1312415267",
-        metadata_hash="2967945306",
+        metadata_hash="1125608408",
     )
 
     assert fingerprint == original_fingerprint
@@ -920,7 +921,7 @@ def test_fingerprint_seed_model():
 
     expected_fingerprint = SnapshotFingerprint(
         data_hash="1909791099",
-        metadata_hash="1153541408",
+        metadata_hash="2315134974",
     )
 
     model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
@@ -959,7 +960,7 @@ def test_fingerprint_jinja_macros(model: Model):
     )
     original_fingerprint = SnapshotFingerprint(
         data_hash="923305614",
-        metadata_hash="2967945306",
+        metadata_hash="1125608408",
     )
 
     fingerprint = fingerprint_from_node(model, nodes={})
@@ -1032,6 +1033,48 @@ def test_fingerprint_virtual_properties(model: Model, parent_model: Model):
     assert updated_fingerprint != fingerprint
     assert updated_fingerprint.metadata_hash != fingerprint.metadata_hash
     assert updated_fingerprint.data_hash == fingerprint.data_hash
+
+
+def test_tableinfo_equality():
+    snapshot_a = SnapshotTableInfo(
+        name="test_schema.a",
+        fingerprint=SnapshotFingerprint(data_hash="1", metadata_hash="1"),
+        version="test_version",
+        physical_schema="test_physical_schema",
+        parents=[],
+        dev_table_suffix="dev",
+    )
+
+    snapshot_b = SnapshotTableInfo(
+        name="test_schema.b",
+        fingerprint=SnapshotFingerprint(data_hash="1", metadata_hash="1"),
+        version="test_version",
+        physical_schema="test_physical_schema",
+        parents=[],
+        dev_table_suffix="dev",
+    )
+
+    snapshot_c = SnapshotTableInfo(
+        name="test_schema.c",
+        fingerprint=SnapshotFingerprint(data_hash="1", metadata_hash="1"),
+        version="test_version",
+        physical_schema="test_physical_schema",
+        parents=[snapshot_a.snapshot_id, snapshot_b.snapshot_id],
+        dev_table_suffix="dev",
+    )
+
+    # parents in different order than snapshot_c
+    snapshot_c2 = SnapshotTableInfo(
+        name="test_schema.c",
+        fingerprint=SnapshotFingerprint(data_hash="1", metadata_hash="1"),
+        version="test_version",
+        physical_schema="test_physical_schema",
+        parents=[snapshot_b.snapshot_id, snapshot_a.snapshot_id],
+        dev_table_suffix="dev",
+    )
+
+    assert snapshot_c is not snapshot_c2
+    assert snapshot_c == snapshot_c2
 
 
 def test_stamp(model: Model):
@@ -2456,7 +2499,10 @@ def test_contiguous_intervals():
 
 def test_check_ready_intervals(mocker: MockerFixture):
     def assert_always_signal(intervals):
-        assert _check_ready_intervals(lambda _: True, intervals) == intervals
+        assert (
+            _check_ready_intervals(lambda _: True, intervals, mocker.Mock(), mocker.Mock())
+            == intervals
+        )
 
     assert_always_signal([])
     assert_always_signal([(0, 1)])
@@ -2464,7 +2510,9 @@ def test_check_ready_intervals(mocker: MockerFixture):
     assert_always_signal([(0, 1), (2, 3)])
 
     def assert_never_signal(intervals):
-        assert _check_ready_intervals(lambda _: False, intervals) == []
+        assert (
+            _check_ready_intervals(lambda _: False, intervals, mocker.Mock(), mocker.Mock()) == []
+        )
 
     assert_never_signal([])
     assert_never_signal([(0, 1)])
@@ -2472,7 +2520,7 @@ def test_check_ready_intervals(mocker: MockerFixture):
     assert_never_signal([(0, 1), (2, 3)])
 
     def assert_empty_signal(intervals):
-        assert _check_ready_intervals(lambda _: [], intervals) == []
+        assert _check_ready_intervals(lambda _: [], intervals, mocker.Mock(), mocker.Mock()) == []
 
     assert_empty_signal([])
     assert_empty_signal([(0, 1)])
@@ -2489,7 +2537,7 @@ def test_check_ready_intervals(mocker: MockerFixture):
     ):
         mock = mocker.Mock()
         mock.side_effect = [to_intervals(r) for r in ready]
-        _check_ready_intervals(mock, intervals) == expected
+        _check_ready_intervals(mock, intervals, mocker.Mock(), mocker.Mock()) == expected
 
     assert_check_intervals([], [], [])
     assert_check_intervals([(0, 1)], [[]], [])
@@ -2528,6 +2576,14 @@ def test_check_ready_intervals(mocker: MockerFixture):
         [[(0, 1)], [(3, 4)]],
         [(0, 1), (3, 4)],
     )
+
+    with pytest.raises(SignalEvalError):
+        _check_ready_intervals(
+            lambda _: (_ for _ in ()).throw(MemoryError("Some exception")),
+            [(0, 1), (1, 2)],
+            mocker.Mock(),
+            mocker.Mock(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2851,7 +2907,7 @@ def test_apply_auto_restatements_disable_restatement_downstream(make_snapshot):
     ]
 
 
-def test_render_signal(make_snapshot):
+def test_render_signal(make_snapshot, mocker):
     @signal()
     def check_types(batch, env: str, default: int = 0):
         if env != "in_memory" or not default == 0:
@@ -2874,4 +2930,4 @@ def test_render_signal(make_snapshot):
         signal_definitions=signal.get_registry(),
     )
     snapshot_a = make_snapshot(sql_model)
-    assert snapshot_a.check_ready_intervals([(0, 1)]) == [(0, 1)]
+    assert snapshot_a.check_ready_intervals([(0, 1)], mocker.Mock()) == [(0, 1)]
